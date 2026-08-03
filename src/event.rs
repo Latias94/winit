@@ -272,7 +272,17 @@ pub enum WindowEvent {
     CursorLeft { device_id: DeviceId },
 
     /// A mouse wheel movement or touchpad scroll occurred.
-    MouseWheel { device_id: DeviceId, delta: MouseScrollDelta, phase: TouchPhase },
+    MouseWheel {
+        device_id: DeviceId,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+        /// The event-time position in physical pixels relative to the top-left corner of the
+        /// window.
+        ///
+        /// This is `None` when the platform backend cannot report a position from the same native
+        /// event. It is never synthesized from a previously observed cursor position.
+        position: Option<PhysicalPosition<f64>>,
+    },
 
     /// An mouse button press has been received.
     MouseInput { device_id: DeviceId, state: ElementState, button: MouseButton },
@@ -304,6 +314,9 @@ pub enum WindowEvent {
         /// Change in pixels of pan gesture from last update.
         delta: PhysicalPosition<f32>,
         phase: TouchPhase,
+        /// The event-time position in physical pixels relative to the top-left corner of the
+        /// window.
+        position: Option<PhysicalPosition<f64>>,
     },
 
     /// Double tap gesture.
@@ -1055,6 +1068,7 @@ mod tests {
                     device_id: did,
                     delta: event::MouseScrollDelta::LineDelta(0.0, 0.0),
                     phase: event::TouchPhase::Started,
+                    position: None,
                 });
                 with_window_event(MouseInput {
                     device_id: did,
@@ -1076,6 +1090,7 @@ mod tests {
                     device_id: did,
                     delta: PhysicalPosition::<f32>::new(0.0, 0.0),
                     phase: event::TouchPhase::Started,
+                    position: None,
                 });
                 with_window_event(TouchpadPressure { device_id: did, pressure: 0.0, stage: 0 });
                 with_window_event(AxisMotion { device_id: did, axis: 0, value: 0.0 });

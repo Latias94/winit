@@ -24,7 +24,7 @@ use super::event::{
 };
 use super::window::WinitWindow;
 use super::DEVICE_ID;
-use crate::dpi::{LogicalPosition, LogicalSize};
+use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use crate::event::{
     DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, TouchPhase,
     WindowEvent,
@@ -697,6 +697,7 @@ declare_class!(
                 device_id: DEVICE_ID,
                 delta,
                 phase,
+                position: Some(self.event_position(event)),
             });
         }
 
@@ -1059,8 +1060,7 @@ impl WinitView {
     }
 
     fn mouse_motion(&self, event: &NSEvent) {
-        let window_point = unsafe { event.locationInWindow() };
-        let view_point = self.convertPoint_fromView(window_point, None);
+        let view_point = self.event_logical_position(event);
         let frame = self.frame();
 
         if view_point.x.is_sign_negative()
@@ -1075,14 +1075,22 @@ impl WinitView {
             }
         }
 
-        let view_point = LogicalPosition::new(view_point.x, view_point.y);
-
         self.update_modifiers(event, false);
 
         self.queue_event(WindowEvent::CursorMoved {
             device_id: DEVICE_ID,
             position: view_point.to_physical(self.scale_factor()),
         });
+    }
+
+    fn event_position(&self, event: &NSEvent) -> PhysicalPosition<f64> {
+        self.event_logical_position(event).to_physical(self.scale_factor())
+    }
+
+    fn event_logical_position(&self, event: &NSEvent) -> LogicalPosition<f64> {
+        let window_point = unsafe { event.locationInWindow() };
+        let view_point = self.convertPoint_fromView(window_point, None);
+        LogicalPosition::new(view_point.x, view_point.y)
     }
 }
 

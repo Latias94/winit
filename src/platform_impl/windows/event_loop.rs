@@ -1022,6 +1022,18 @@ fn update_modifiers(window: HWND, userdata: &WindowData) {
     }
 }
 
+fn wheel_position(window: HWND, lparam: LPARAM) -> Option<PhysicalPosition<f64>> {
+    let mut position = POINT {
+        x: super::get_x_lparam(lparam as u32) as i32,
+        y: super::get_y_lparam(lparam as u32) as i32,
+    };
+    if unsafe { ScreenToClient(window, &mut position) } == false.into() {
+        None
+    } else {
+        Some(PhysicalPosition::new(position.x as f64, position.y as f64))
+    }
+}
+
 unsafe fn gain_active_focus(window: HWND, userdata: &WindowData) {
     use crate::event::WindowEvent::Focused;
 
@@ -1738,6 +1750,7 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     delta: LineDelta(0.0, value),
                     phase: TouchPhase::Moved,
+                    position: wheel_position(window, lparam),
                 },
             });
 
@@ -1758,6 +1771,7 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     delta: LineDelta(value, 0.0),
                     phase: TouchPhase::Moved,
+                    position: wheel_position(window, lparam),
                 },
             });
 

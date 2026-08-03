@@ -375,7 +375,7 @@ impl Canvas {
 
     pub fn on_mouse_wheel<F>(&mut self, mut handler: F)
     where
-        F: 'static + FnMut(i32, MouseScrollDelta, ModifiersState),
+        F: 'static + FnMut(i32, MouseScrollDelta, ModifiersState, PhysicalPosition<f64>),
     {
         let window = self.common.window.clone();
         let prevent_default = Rc::clone(&self.prevent_default);
@@ -386,7 +386,9 @@ impl Canvas {
 
             if let Some(delta) = event::mouse_scroll_delta(&window, &event) {
                 let modifiers = event::mouse_modifiers(&event);
-                handler(0, delta, modifiers);
+                let position =
+                    event::mouse_position(&event).to_physical(super::scale_factor(&window));
+                handler(0, delta, modifiers, position);
             }
         }));
     }

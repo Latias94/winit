@@ -1090,6 +1090,7 @@ impl EventProcessor {
                     _ => unreachable!(),
                 },
                 phase: TouchPhase::Moved,
+                position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
             },
             8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back },
 
@@ -1164,7 +1165,12 @@ impl EventProcessor {
                     ScrollOrientation::Vertical => MouseScrollDelta::LineDelta(0.0, -delta as f32),
                 };
 
-                WindowEvent::MouseWheel { device_id, delta, phase: TouchPhase::Moved }
+                WindowEvent::MouseWheel {
+                    device_id,
+                    delta,
+                    phase: TouchPhase::Moved,
+                    position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
+                }
             } else {
                 WindowEvent::AxisMotion { device_id, axis: i as u32, value: unsafe { *value } }
             };

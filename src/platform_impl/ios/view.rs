@@ -310,6 +310,14 @@ declare_class!(
                     device_id: DEVICE_ID,
                     delta: PhysicalPosition::new(dx as _, dy as _),
                     phase,
+                    position: {
+                        let location = unsafe { recognizer.locationInView(Some(self)) };
+                        let scale_factor = self.contentScaleFactor() as f64;
+                        Some(PhysicalPosition::new(
+                            location.x as f64 * scale_factor,
+                            location.y as f64 * scale_factor,
+                        ))
+                    },
                 },
             });
 

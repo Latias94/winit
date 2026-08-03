@@ -490,7 +490,7 @@ impl ActiveEventLoop {
 
         let runner = self.runner.clone();
         let modifiers = self.modifiers.clone();
-        canvas.on_mouse_wheel(move |pointer_id, delta, active_modifiers| {
+        canvas.on_mouse_wheel(move |pointer_id, delta, active_modifiers, position| {
             let modifiers_changed =
                 (has_focus.get() && modifiers.get() != active_modifiers).then(|| {
                     modifiers.set(active_modifiers);
@@ -507,6 +507,7 @@ impl ActiveEventLoop {
                         device_id: RootDeviceId(DeviceId(pointer_id)),
                         delta,
                         phase: TouchPhase::Moved,
+                        position: Some(position),
                     },
                 },
             )));
