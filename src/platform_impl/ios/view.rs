@@ -310,6 +310,7 @@ declare_class!(
                     device_id: DEVICE_ID,
                     delta: PhysicalPosition::new(dx as _, dy as _),
                     phase,
+                    modifiers: None,
                     position: {
                         let location = unsafe { recognizer.locationInView(Some(self)) };
                         let scale_factor = self.contentScaleFactor() as f64;

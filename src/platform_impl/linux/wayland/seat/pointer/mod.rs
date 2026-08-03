@@ -210,7 +210,13 @@ impl PointerHandler for WinitState {
                     };
 
                     self.events_sink.push_window_event(
-                        WindowEvent::MouseWheel { device_id, delta, phase, position: None },
+                        WindowEvent::MouseWheel {
+                            device_id,
+                            delta,
+                            phase,
+                            modifiers: None,
+                            position: None,
+                        },
                         window_id,
                     )
                 },

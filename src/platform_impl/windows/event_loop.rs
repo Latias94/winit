@@ -1000,7 +1000,7 @@ fn normalize_pointer_pressure(pressure: u32) -> Option<Force> {
 
 /// Emit a `ModifiersChanged` event whenever modifiers have changed.
 /// Returns the current modifier state
-fn update_modifiers(window: HWND, userdata: &WindowData) {
+fn update_modifiers(window: HWND, userdata: &WindowData) -> ModifiersState {
     use crate::event::WindowEvent::ModifiersChanged;
 
     let modifiers = {
@@ -1020,6 +1020,8 @@ fn update_modifiers(window: HWND, userdata: &WindowData) {
             event: ModifiersChanged(modifiers.into()),
         });
     }
+
+    modifiers
 }
 
 fn wheel_position(window: HWND, lparam: LPARAM) -> Option<PhysicalPosition<f64>> {
@@ -1742,7 +1744,7 @@ unsafe fn public_window_callback_inner(
             let value = (wparam >> 16) as i16;
             let value = value as f32 / WHEEL_DELTA as f32;
 
-            update_modifiers(window, userdata);
+            let modifiers = update_modifiers(window, userdata);
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
@@ -1750,6 +1752,7 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     delta: LineDelta(0.0, value),
                     phase: TouchPhase::Moved,
+                    modifiers: Some(modifiers),
                     position: wheel_position(window, lparam),
                 },
             });
@@ -1763,7 +1766,7 @@ unsafe fn public_window_callback_inner(
             let value = (wparam >> 16) as i16;
             let value = -value as f32 / WHEEL_DELTA as f32; // NOTE: inverted! See https://github.com/rust-windowing/winit/pull/2105/
 
-            update_modifiers(window, userdata);
+            let modifiers = update_modifiers(window, userdata);
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
@@ -1771,6 +1774,7 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     delta: LineDelta(value, 0.0),
                     phase: TouchPhase::Moved,
+                    modifiers: Some(modifiers),
                     position: wheel_position(window, lparam),
                 },
             });

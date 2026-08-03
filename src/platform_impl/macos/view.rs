@@ -697,6 +697,7 @@ declare_class!(
                 device_id: DEVICE_ID,
                 delta,
                 phase,
+                modifiers: Some(event_mods(event).state()),
                 position: Some(self.event_position(event)),
             });
         }

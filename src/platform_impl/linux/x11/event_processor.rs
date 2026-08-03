@@ -223,23 +223,23 @@ impl EventProcessor {
                         };
 
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
-                        self.update_mods_from_xinput2_event(
+                        let modifiers = self.update_mods_from_xinput2_event(
                             &xev.mods,
                             &xev.group,
                             false,
                             &mut callback,
                         );
-                        self.xinput2_button_input(xev, state, &mut callback);
+                        self.xinput2_button_input(xev, state, modifiers, &mut callback);
                     },
                     xinput2::XI_Motion => {
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
-                        self.update_mods_from_xinput2_event(
+                        let modifiers = self.update_mods_from_xinput2_event(
                             &xev.mods,
                             &xev.group,
                             false,
                             &mut callback,
                         );
-                        self.xinput2_mouse_motion(xev, &mut callback);
+                        self.xinput2_mouse_motion(xev, modifiers, &mut callback);
                     },
                     xinput2::XI_Enter => {
                         let xev: &XIEnterEvent = unsafe { xev.as_event() };
@@ -247,7 +247,7 @@ impl EventProcessor {
                     },
                     xinput2::XI_Leave => {
                         let xev: &XILeaveEvent = unsafe { xev.as_event() };
-                        self.update_mods_from_xinput2_event(
+                        let _ = self.update_mods_from_xinput2_event(
                             &xev.mods,
                             &xev.group,
                             false,
@@ -1048,6 +1048,7 @@ impl EventProcessor {
         &self,
         event: &XIDeviceEvent,
         state: ElementState,
+        modifiers: Option<ModifiersState>,
         mut callback: F,
     ) where
         F: FnMut(&RootAEL, Event<T>),
@@ -1090,6 +1091,7 @@ impl EventProcessor {
                     _ => unreachable!(),
                 },
                 phase: TouchPhase::Moved,
+                modifiers,
                 position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
             },
             8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back },
@@ -1102,8 +1104,12 @@ impl EventProcessor {
         callback(&self.target, event);
     }
 
-    fn xinput2_mouse_motion<T: 'static, F>(&self, event: &XIDeviceEvent, mut callback: F)
-    where
+    fn xinput2_mouse_motion<T: 'static, F>(
+        &self,
+        event: &XIDeviceEvent,
+        modifiers: Option<ModifiersState>,
+        mut callback: F,
+    ) where
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
@@ -1169,6 +1175,7 @@ impl EventProcessor {
                     device_id,
                     delta,
                     phase: TouchPhase::Moved,
+                    modifiers,
                     position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
                 }
             } else {
@@ -1630,10 +1637,11 @@ impl EventProcessor {
         group: &XIModifierState,
         force: bool,
         mut callback: F,
-    ) where
+    ) -> Option<ModifiersState>
+    where
         F: FnMut(&RootAEL, Event<T>),
     {
-        if let Some(state) = self.xkb_context.state_mut() {
+        let modifiers = if let Some(state) = self.xkb_context.state_mut() {
             state.update_modifiers(
                 mods.base as u32,
                 mods.latched as u32,
@@ -1642,17 +1650,20 @@ impl EventProcessor {
                 group.latched as u32,
                 group.locked as u32,
             );
+            Some(state.modifiers().into())
+        } else {
+            None
+        };
 
-            // NOTE: we use active window since generally sub windows don't have keyboard input,
-            // and winit assumes that unfocused window doesn't have modifiers.
-            let window_id = match self.active_window.map(super::mkwid) {
-                Some(window_id) => window_id,
-                None => return,
-            };
-
-            let mods = state.modifiers();
-            self.send_modifiers(window_id, mods.into(), force, &mut callback);
+        // NOTE: we use active window since generally sub windows don't have keyboard input,
+        // and winit assumes that unfocused window doesn't have modifiers.
+        if let (Some(window_id), Some(modifiers)) =
+            (self.active_window.map(super::mkwid), modifiers)
+        {
+            self.send_modifiers(window_id, modifiers, force, &mut callback);
         }
+
+        modifiers
     }
 
     fn update_mods_from_query<T: 'static, F>(

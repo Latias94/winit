@@ -276,6 +276,12 @@ pub enum WindowEvent {
         device_id: DeviceId,
         delta: MouseScrollDelta,
         phase: TouchPhase,
+        /// The modifier state observed for this native event.
+        ///
+        /// This is `None` when the platform backend cannot report modifiers from the same native
+        /// event or callback. It is never synthesized from a previously emitted
+        /// [`WindowEvent::ModifiersChanged`] event.
+        modifiers: Option<ModifiersState>,
         /// The event-time position in physical pixels relative to the top-left corner of the
         /// window.
         ///
@@ -314,6 +320,12 @@ pub enum WindowEvent {
         /// Change in pixels of pan gesture from last update.
         delta: PhysicalPosition<f32>,
         phase: TouchPhase,
+        /// The modifier state observed for this native gesture update.
+        ///
+        /// This is `None` when the platform backend cannot report modifiers from the same native
+        /// gesture update. It is never synthesized from a previously emitted
+        /// [`WindowEvent::ModifiersChanged`] event.
+        modifiers: Option<ModifiersState>,
         /// The event-time position in physical pixels relative to the top-left corner of the
         /// window.
         position: Option<PhysicalPosition<f64>>,
@@ -1024,6 +1036,7 @@ impl PartialEq for InnerSizeWriter {
 mod tests {
     use crate::dpi::PhysicalPosition;
     use crate::event;
+    use crate::keyboard::ModifiersState;
     use std::collections::{BTreeSet, HashSet};
 
     macro_rules! foreach_event {
@@ -1068,6 +1081,7 @@ mod tests {
                     device_id: did,
                     delta: event::MouseScrollDelta::LineDelta(0.0, 0.0),
                     phase: event::TouchPhase::Started,
+                    modifiers: Some(ModifiersState::empty()),
                     position: None,
                 });
                 with_window_event(MouseInput {
@@ -1090,6 +1104,7 @@ mod tests {
                     device_id: did,
                     delta: PhysicalPosition::<f32>::new(0.0, 0.0),
                     phase: event::TouchPhase::Started,
+                    modifiers: None,
                     position: None,
                 });
                 with_window_event(TouchpadPressure { device_id: did, pressure: 0.0, stage: 0 });
