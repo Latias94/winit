@@ -290,8 +290,18 @@ pub enum WindowEvent {
         position: Option<PhysicalPosition<f64>>,
     },
 
-    /// An mouse button press has been received.
-    MouseInput { device_id: DeviceId, state: ElementState, button: MouseButton },
+    /// A mouse button press or release has been received.
+    MouseInput {
+        device_id: DeviceId,
+        state: ElementState,
+        button: MouseButton,
+        /// The event-time position in physical pixels relative to the top-left corner of the
+        /// window.
+        ///
+        /// This is `None` when the platform backend cannot report a position from the same native
+        /// event. It is never synthesized from a previously observed cursor position.
+        position: Option<PhysicalPosition<f64>>,
+    },
 
     /// Two-finger pinch gesture, often used for magnification.
     ///
@@ -1088,6 +1098,7 @@ mod tests {
                     device_id: did,
                     state: event::ElementState::Pressed,
                     button: event::MouseButton::Other(0),
+                    position: None,
                 });
                 with_window_event(PinchGesture {
                     device_id: did,

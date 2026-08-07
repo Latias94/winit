@@ -349,7 +349,12 @@ impl ActiveEventLoop {
                         },
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
-                            event: WindowEvent::MouseInput { device_id, state, button },
+                            event: WindowEvent::MouseInput {
+                                device_id,
+                                state,
+                                button,
+                                position: Some(position),
+                            },
                         },
                     ]));
                 }
@@ -386,6 +391,7 @@ impl ActiveEventLoop {
                                 device_id,
                                 state: ElementState::Pressed,
                                 button,
+                                position: Some(position),
                             },
                         },
                     ]));
@@ -452,6 +458,7 @@ impl ActiveEventLoop {
                                 device_id,
                                 state: ElementState::Released,
                                 button,
+                                position: Some(position),
                             },
                         },
                     ]));

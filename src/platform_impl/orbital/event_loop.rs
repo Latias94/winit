@@ -432,6 +432,7 @@ impl<T: 'static> EventLoop<T> {
                             device_id: event::DeviceId(DeviceId),
                             state,
                             button,
+                            position: None,
                         },
                     });
                 }

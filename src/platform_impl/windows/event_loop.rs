@@ -1036,6 +1036,13 @@ fn wheel_position(window: HWND, lparam: LPARAM) -> Option<PhysicalPosition<f64>>
     }
 }
 
+fn mouse_input_position(lparam: LPARAM) -> PhysicalPosition<f64> {
+    PhysicalPosition::new(
+        f64::from(super::get_x_lparam(lparam as u32)),
+        f64::from(super::get_y_lparam(lparam as u32)),
+    )
+}
+
 unsafe fn gain_active_focus(window: HWND, userdata: &WindowData) {
     use crate::event::WindowEvent::Focused;
 
@@ -1807,7 +1814,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Left },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Pressed,
+                    button: Left,
+                    position: Some(mouse_input_position(lparam)),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1823,7 +1835,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Left },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Released,
+                    button: Left,
+                    position: Some(mouse_input_position(lparam)),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1839,7 +1856,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Right },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Pressed,
+                    button: Right,
+                    position: Some(mouse_input_position(lparam)),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1855,7 +1877,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Right },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Released,
+                    button: Right,
+                    position: Some(mouse_input_position(lparam)),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1871,7 +1898,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Middle },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Pressed,
+                    button: Middle,
+                    position: Some(mouse_input_position(lparam)),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1887,7 +1919,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Middle },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Released,
+                    button: Middle,
+                    position: Some(mouse_input_position(lparam)),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1912,6 +1949,7 @@ unsafe fn public_window_callback_inner(
                         2 => Forward,
                         _ => Other(xbutton),
                     },
+                    position: Some(mouse_input_position(lparam)),
                 },
             });
             result = ProcResult::Value(0);
@@ -1937,6 +1975,7 @@ unsafe fn public_window_callback_inner(
                         2 => Forward,
                         _ => Other(xbutton),
                     },
+                    position: Some(mouse_input_position(lparam)),
                 },
             });
             result = ProcResult::Value(0);

@@ -1065,16 +1065,17 @@ impl EventProcessor {
             return;
         }
 
+        let position = Some(PhysicalPosition::new(event.event_x, event.event_y));
         let event = match event.detail as u32 {
             xlib::Button1 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Left }
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Left, position }
             },
             xlib::Button2 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle }
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle, position }
             },
 
             xlib::Button3 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Right }
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Right, position }
             },
 
             // Suppress emulated scroll wheel clicks, since we handle the real motion events for
@@ -1092,12 +1093,19 @@ impl EventProcessor {
                 },
                 phase: TouchPhase::Moved,
                 modifiers,
-                position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
+                position,
             },
-            8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back },
+            8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back, position },
 
-            9 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Forward },
-            x => WindowEvent::MouseInput { device_id, state, button: MouseButton::Other(x as u16) },
+            9 => {
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Forward, position }
+            },
+            x => WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Other(x as u16),
+                position,
+            },
         };
 
         let event = Event::WindowEvent { window_id, event };

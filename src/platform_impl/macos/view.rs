@@ -1057,6 +1057,7 @@ impl WinitView {
             device_id: DEVICE_ID,
             state: button_state,
             button,
+            position: Some(self.event_position(event)),
         });
     }
 
