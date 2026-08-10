@@ -14,8 +14,8 @@ use super::runner::{EventWrapper, Execution};
 use super::window::WindowId;
 use super::{backend, runner};
 use crate::event::{
-    DeviceId as RootDeviceId, ElementState, Event, KeyEvent, PointerEventFacts, Touch, TouchPhase,
-    WindowEvent,
+    DeviceId as RootDeviceId, ElementState, Event, KeyEvent, PointerEventFacts, PointerWindowRoute,
+    Touch, TouchPhase, WindowEvent,
 };
 use crate::event_loop::{ControlFlow, DeviceEvents};
 use crate::keyboard::ModifiersState;
@@ -279,7 +279,16 @@ impl ActiveEventLoop {
 
                         iter::once(Event::WindowEvent {
                             window_id: RootWindowId(id),
-                            event: WindowEvent::CursorMoved { device_id, position },
+                            event: WindowEvent::CursorMoved {
+                                device_id,
+                                position,
+                                facts: PointerEventFacts {
+                                    surface_position: Some(position),
+                                    hover: PointerWindowRoute::Window(RootWindowId(id)),
+                                    capture: PointerWindowRoute::None,
+                                    ..PointerEventFacts::default()
+                                },
+                            },
                         })
                     })));
                 }
@@ -346,7 +355,16 @@ impl ActiveEventLoop {
                     runner.send_events(modifiers.into_iter().chain([
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
-                            event: WindowEvent::CursorMoved { device_id, position },
+                            event: WindowEvent::CursorMoved {
+                                device_id,
+                                position,
+                                facts: PointerEventFacts {
+                                    surface_position: Some(position),
+                                    hover: PointerWindowRoute::Window(RootWindowId(id)),
+                                    capture: PointerWindowRoute::None,
+                                    ..PointerEventFacts::default()
+                                },
+                            },
                         },
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
@@ -358,6 +376,8 @@ impl ActiveEventLoop {
                                     surface_position: Some(position),
                                     desktop_position: None,
                                     modifiers: Some(active_modifiers),
+                                    hover: PointerWindowRoute::Window(RootWindowId(id)),
+                                    capture: PointerWindowRoute::None,
                                 },
                             },
                         },
@@ -388,7 +408,16 @@ impl ActiveEventLoop {
                     runner.send_events(modifiers.into_iter().chain([
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
-                            event: WindowEvent::CursorMoved { device_id, position },
+                            event: WindowEvent::CursorMoved {
+                                device_id,
+                                position,
+                                facts: PointerEventFacts {
+                                    surface_position: Some(position),
+                                    hover: PointerWindowRoute::Window(RootWindowId(id)),
+                                    capture: PointerWindowRoute::None,
+                                    ..PointerEventFacts::default()
+                                },
+                            },
                         },
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
@@ -400,6 +429,8 @@ impl ActiveEventLoop {
                                     surface_position: Some(position),
                                     desktop_position: None,
                                     modifiers: Some(active_modifiers),
+                                    hover: PointerWindowRoute::Window(RootWindowId(id)),
+                                    capture: PointerWindowRoute::None,
                                 },
                             },
                         },
@@ -459,7 +490,16 @@ impl ActiveEventLoop {
                     runner.send_events(modifiers.into_iter().chain([
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
-                            event: WindowEvent::CursorMoved { device_id, position },
+                            event: WindowEvent::CursorMoved {
+                                device_id,
+                                position,
+                                facts: PointerEventFacts {
+                                    surface_position: Some(position),
+                                    hover: PointerWindowRoute::Window(RootWindowId(id)),
+                                    capture: PointerWindowRoute::None,
+                                    ..PointerEventFacts::default()
+                                },
+                            },
                         },
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
@@ -471,6 +511,8 @@ impl ActiveEventLoop {
                                     surface_position: Some(position),
                                     desktop_position: None,
                                     modifiers: Some(active_modifiers),
+                                    hover: PointerWindowRoute::Window(RootWindowId(id)),
+                                    capture: PointerWindowRoute::None,
                                 },
                             },
                         },
@@ -531,6 +573,8 @@ impl ActiveEventLoop {
                             surface_position: Some(position),
                             desktop_position: None,
                             modifiers: Some(active_modifiers),
+                            hover: PointerWindowRoute::Window(RootWindowId(id)),
+                            capture: PointerWindowRoute::None,
                         },
                     },
                 },

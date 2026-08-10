@@ -415,6 +415,10 @@ impl<T: 'static> EventLoop<T> {
                     event: event::WindowEvent::CursorMoved {
                         device_id: event::DeviceId(DeviceId),
                         position: (x, y).into(),
+                        facts: event::PointerEventFacts {
+                            surface_position: Some((x, y).into()),
+                            ..event::PointerEventFacts::default()
+                        },
                     },
                 });
             },

@@ -168,6 +168,38 @@ pub struct PointerEventFacts {
 
     /// The complete modifier state reported by the same native event or callback.
     pub modifiers: Option<ModifiersState>,
+
+    /// The window under the pointer when the native event was produced.
+    ///
+    /// This is independent of the delivery window attached to the enclosing
+    /// [`Event::WindowEvent`]. In particular, captured input can be delivered to one window while
+    /// the pointer is hovering another window.
+    pub hover: PointerWindowRoute,
+
+    /// The window owning pointer capture after this native event was applied.
+    ///
+    /// This is independent of both the delivery window and [`Self::hover`].
+    pub capture: PointerWindowRoute,
+}
+
+/// An event-time route to a platform window.
+///
+/// This type reports only platform routing facts. It does not imply that a UI receiver accepted
+/// the event or that the window belongs to a particular application-level surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum PointerWindowRoute {
+    /// The platform backend could not prove the route from the native event or callback.
+    #[default]
+    Unknown,
+
+    /// The platform proved that no window owns this route.
+    None,
+
+    /// The platform proved that the route names this winit window.
+    Window(WindowId),
+
+    /// The platform proved that the route names a window outside the winit window roster.
+    Foreign,
 }
 
 /// Describes an event from a [`Window`].
@@ -270,6 +302,9 @@ pub enum WindowEvent {
         /// the OS to implement effects such as cursor acceleration, it should not be used
         /// to implement non-cursor-like interactions such as 3D camera control.
         position: PhysicalPosition<f64>,
+
+        /// Facts captured from the native event that produced this movement.
+        facts: PointerEventFacts,
     },
 
     /// The cursor has entered the window.
@@ -293,6 +328,13 @@ pub enum WindowEvent {
     /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
     /// [`transform`]: https://developer.mozilla.org/en-US/docs/Web/CSS/transform
     CursorLeft { device_id: DeviceId },
+
+    /// The platform pointer-capture owner changed independently of a button edge.
+    PointerCaptureChanged {
+        device_id: DeviceId,
+        /// The capture owner after the transition.
+        capture: PointerWindowRoute,
+    },
 
     /// A mouse wheel movement or touchpad scroll occurred.
     MouseWheel {
@@ -1082,10 +1124,18 @@ mod tests {
                 with_window_event(HoveredFile("x.txt".into()));
                 with_window_event(HoveredFileCancelled);
                 with_window_event(Ime(Enabled));
-                with_window_event(CursorMoved { device_id: did, position: (0, 0).into() });
+                with_window_event(CursorMoved {
+                    device_id: did,
+                    position: (0, 0).into(),
+                    facts: event::PointerEventFacts::default(),
+                });
                 with_window_event(ModifiersChanged(event::Modifiers::default()));
                 with_window_event(CursorEntered { device_id: did });
                 with_window_event(CursorLeft { device_id: did });
+                with_window_event(PointerCaptureChanged {
+                    device_id: did,
+                    capture: event::PointerWindowRoute::None,
+                });
                 with_window_event(MouseWheel {
                     device_id: did,
                     delta: event::MouseScrollDelta::LineDelta(0.0, 0.0),

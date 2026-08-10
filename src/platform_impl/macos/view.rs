@@ -30,10 +30,11 @@ use super::DEVICE_ID;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use crate::event::{
     DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta,
-    PointerEventFacts, TouchPhase, WindowEvent,
+    PointerEventFacts, PointerWindowRoute, TouchPhase, WindowEvent,
 };
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
 use crate::platform::macos::OptionAsAlt;
+use crate::window::WindowId as RootWindowId;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -1089,6 +1090,7 @@ impl WinitView {
         self.queue_event(WindowEvent::CursorMoved {
             device_id: DEVICE_ID,
             position: view_point.to_physical(self.scale_factor()),
+            facts: self.cursor_moved_facts(view_point),
         });
     }
 
@@ -1097,11 +1099,50 @@ impl WinitView {
     }
 
     fn pointer_event_facts(&self, event: &NSEvent) -> PointerEventFacts {
+        let position = self.event_position(event);
+        let hover = if unsafe { NSEvent::pressedMouseButtons() } == 0
+            && self.point_is_inside_view(position)
+        {
+            PointerWindowRoute::Window(RootWindowId(self.window().id()))
+        } else {
+            PointerWindowRoute::Unknown
+        };
+
         PointerEventFacts {
-            surface_position: Some(self.event_position(event)),
+            surface_position: Some(position),
             desktop_position: event_desktop_position(event),
             modifiers: Some(event_mods(event).state()),
+            hover,
+            capture: PointerWindowRoute::Unknown,
         }
+    }
+
+    fn cursor_moved_facts(&self, position: LogicalPosition<f64>) -> PointerEventFacts {
+        let position = position.to_physical(self.scale_factor());
+        let hover = if unsafe { NSEvent::pressedMouseButtons() } == 0
+            && self.point_is_inside_view(position)
+        {
+            PointerWindowRoute::Window(RootWindowId(self.window().id()))
+        } else {
+            PointerWindowRoute::Unknown
+        };
+
+        PointerEventFacts {
+            surface_position: Some(position),
+            desktop_position: None,
+            modifiers: None,
+            hover,
+            capture: PointerWindowRoute::Unknown,
+        }
+    }
+
+    fn point_is_inside_view(&self, position: PhysicalPosition<f64>) -> bool {
+        let frame = self.frame();
+        let scale = self.scale_factor();
+        position.x >= 0.0
+            && position.y >= 0.0
+            && position.x <= frame.size.width * scale
+            && position.y <= frame.size.height * scale
     }
 
     fn event_logical_position(&self, event: &NSEvent) -> LogicalPosition<f64> {

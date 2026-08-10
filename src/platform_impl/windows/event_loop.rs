@@ -44,7 +44,7 @@ use windows_sys::Win32::UI::Input::Touch::{
 use windows_sys::Win32::UI::Input::{RAWINPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMenu, GetMessagePos, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
+    GetMenu, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
     RegisterClassExW, RegisterWindowMessageA, SetCursor, SetWindowPos, TranslateMessage,
     CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT,
     MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, PT_PEN,
@@ -66,8 +66,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::error::EventLoopError;
 use crate::event::{
-    DeviceEvent, Event, Force, Ime, InnerSizeWriter, PointerEventFacts, RawKeyEvent, Touch,
-    TouchPhase, WindowEvent,
+    DeviceEvent, Event, Force, Ime, InnerSizeWriter, PointerEventFacts, PointerWindowRoute,
+    RawKeyEvent, Touch, TouchPhase, WindowEvent,
 };
 use crate::event_loop::{ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents, EventLoopClosed};
 use crate::keyboard::ModifiersState;
@@ -108,6 +108,20 @@ use super::SelectedCursor;
 /// the real `UserEvent` is pulled from the mpsc channel directly
 /// when the placeholder event is delivered to the event handler
 pub(crate) struct UserEventPlaceholder;
+
+#[derive(Clone, Copy)]
+struct DispatchedMessageFacts {
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    desktop_x: i32,
+    desktop_y: i32,
+}
+
+thread_local! {
+    static DISPATCHED_MESSAGE_FACTS: Cell<Option<DispatchedMessageFacts>> = const { Cell::new(None) };
+}
 
 // here below, the generic `EventLoopRunnerShared<T>` is replaced with
 // `EventLoopRunnerShared<UserEventPlaceholder>` so we can get rid
@@ -417,7 +431,18 @@ impl<T: 'static> EventLoop<T> {
                 };
                 if !handled {
                     TranslateMessage(&msg);
+                    let facts = DispatchedMessageFacts {
+                        window: msg.hwnd,
+                        message: msg.message,
+                        wparam: msg.wParam,
+                        lparam: msg.lParam,
+                        desktop_x: msg.pt.x,
+                        desktop_y: msg.pt.y,
+                    };
+                    let previous =
+                        DISPATCHED_MESSAGE_FACTS.with(|current| current.replace(Some(facts)));
                     DispatchMessageW(&msg);
+                    DISPATCHED_MESSAGE_FACTS.with(|current| current.set(previous));
                 }
             }
 
@@ -983,12 +1008,21 @@ unsafe fn capture_mouse(window: HWND, window_state: &mut WindowState) {
 
 /// Release mouse input, stopping windows on this thread from receiving mouse input when the cursor
 /// is outside the window.
-unsafe fn release_mouse(mut window_state: MutexGuard<'_, WindowState>) {
+unsafe fn release_mouse(
+    window: HWND,
+    mut window_state: MutexGuard<'_, WindowState>,
+) -> PointerWindowRoute {
     window_state.mouse.capture_count = window_state.mouse.capture_count.saturating_sub(1);
-    if window_state.mouse.capture_count == 0 {
-        // ReleaseCapture() causes a WM_CAPTURECHANGED where we lock the window_state.
-        drop(window_state);
-        unsafe { ReleaseCapture() };
+    if window_state.mouse.capture_count != 0 {
+        return PointerWindowRoute::Window(RootWindowId(WindowId(window)));
+    }
+
+    // ReleaseCapture() causes a WM_CAPTURECHANGED where we lock the window_state.
+    drop(window_state);
+    if unsafe { ReleaseCapture() } == 0 {
+        PointerWindowRoute::Unknown
+    } else {
+        PointerWindowRoute::None
     }
 }
 
@@ -1034,7 +1068,11 @@ fn wheel_surface_position(window: HWND, lparam: LPARAM) -> Option<PhysicalPositi
     }
 }
 
-fn wheel_event_facts(window: HWND, lparam: LPARAM) -> PointerEventFacts {
+fn wheel_event_facts(
+    window: HWND,
+    lparam: LPARAM,
+    capture: PointerWindowRoute,
+) -> PointerEventFacts {
     PointerEventFacts {
         surface_position: wheel_surface_position(window, lparam),
         desktop_position: Some(PhysicalPosition::new(
@@ -1044,27 +1082,46 @@ fn wheel_event_facts(window: HWND, lparam: LPARAM) -> PointerEventFacts {
         // WM_MOUSEWHEEL reports only part of the keyboard modifier roster. Do not combine that
         // partial event-time state with callback-time keyboard queries and call it exact.
         modifiers: None,
+        // WM_MOUSEWHEEL is delivered to the focus window rather than carrying an authoritative
+        // hit-test target. Keep hover unknown instead of treating the delivery window as hovered.
+        hover: PointerWindowRoute::Unknown,
+        capture,
     }
 }
 
-fn desktop_message_position() -> Option<PhysicalPosition<f64>> {
-    let position = unsafe { GetMessagePos() };
-    (position != u32::MAX).then(|| {
-        PhysicalPosition::new(
-            f64::from(super::get_x_lparam(position)),
-            f64::from(super::get_y_lparam(position)),
-        )
+fn dispatched_desktop_position(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<PhysicalPosition<f64>> {
+    DISPATCHED_MESSAGE_FACTS.with(|current| {
+        let facts = current.get()?;
+        (facts.window == window
+            && facts.message == message
+            && facts.wparam == wparam
+            && facts.lparam == lparam)
+            .then(|| PhysicalPosition::new(facts.desktop_x as f64, facts.desktop_y as f64))
     })
 }
 
-fn mouse_input_facts(lparam: LPARAM) -> PointerEventFacts {
+fn mouse_input_facts(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    hover: PointerWindowRoute,
+    capture: PointerWindowRoute,
+) -> PointerEventFacts {
     PointerEventFacts {
         surface_position: Some(PhysicalPosition::new(
             f64::from(super::get_x_lparam(lparam as u32)),
             f64::from(super::get_y_lparam(lparam as u32)),
         )),
-        desktop_position: desktop_message_position(),
+        desktop_position: dispatched_desktop_position(window, message, wparam, lparam),
         modifiers: None,
+        hover,
+        capture,
     }
 }
 
@@ -1746,9 +1803,34 @@ unsafe fn public_window_callback_inner(
             if cursor_moved {
                 update_modifiers(window, userdata);
 
+                let capture_count = userdata.window_state_lock().mouse.capture_count;
+                let (hover, capture) = if capture_count == 0 {
+                    (
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                        PointerWindowRoute::None,
+                    )
+                } else {
+                    (
+                        PointerWindowRoute::Unknown,
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                    )
+                };
+
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
-                    event: CursorMoved { device_id: DEVICE_ID, position },
+                    event: CursorMoved {
+                        device_id: DEVICE_ID,
+                        position,
+                        facts: PointerEventFacts {
+                            surface_position: Some(position),
+                            desktop_position: dispatched_desktop_position(
+                                window, msg, wparam, lparam,
+                            ),
+                            modifiers: None,
+                            hover,
+                            capture,
+                        },
+                    },
                 });
             }
 
@@ -1778,13 +1860,20 @@ unsafe fn public_window_callback_inner(
 
             update_modifiers(window, userdata);
 
+            let capture_count = userdata.window_state_lock().mouse.capture_count;
+            let capture = if capture_count == 0 {
+                PointerWindowRoute::None
+            } else {
+                PointerWindowRoute::Window(RootWindowId(WindowId(window)))
+            };
+
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: WindowEvent::MouseWheel {
                     device_id: DEVICE_ID,
                     delta: LineDelta(0.0, value),
                     phase: TouchPhase::Moved,
-                    facts: wheel_event_facts(window, lparam),
+                    facts: wheel_event_facts(window, lparam, capture),
                 },
             });
 
@@ -1799,13 +1888,20 @@ unsafe fn public_window_callback_inner(
 
             update_modifiers(window, userdata);
 
+            let capture_count = userdata.window_state_lock().mouse.capture_count;
+            let capture = if capture_count == 0 {
+                PointerWindowRoute::None
+            } else {
+                PointerWindowRoute::Window(RootWindowId(WindowId(window)))
+            };
+
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: WindowEvent::MouseWheel {
                     device_id: DEVICE_ID,
                     delta: LineDelta(value, 0.0),
                     phase: TouchPhase::Moved,
-                    facts: wheel_event_facts(window, lparam),
+                    facts: wheel_event_facts(window, lparam, capture),
                 },
             });
 
@@ -1841,7 +1937,14 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     state: Pressed,
                     button: Left,
-                    facts: mouse_input_facts(lparam),
+                    facts: mouse_input_facts(
+                        window,
+                        msg,
+                        wparam,
+                        lparam,
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                    ),
                 },
             });
             result = ProcResult::Value(0);
@@ -1852,7 +1955,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Left;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { release_mouse(userdata.window_state_lock()) };
+            let capture = unsafe { release_mouse(window, userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
 
@@ -1862,7 +1965,14 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     state: Released,
                     button: Left,
-                    facts: mouse_input_facts(lparam),
+                    facts: mouse_input_facts(
+                        window,
+                        msg,
+                        wparam,
+                        lparam,
+                        PointerWindowRoute::Unknown,
+                        capture,
+                    ),
                 },
             });
             result = ProcResult::Value(0);
@@ -1883,7 +1993,14 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     state: Pressed,
                     button: Right,
-                    facts: mouse_input_facts(lparam),
+                    facts: mouse_input_facts(
+                        window,
+                        msg,
+                        wparam,
+                        lparam,
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                    ),
                 },
             });
             result = ProcResult::Value(0);
@@ -1894,7 +2011,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Right;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { release_mouse(userdata.window_state_lock()) };
+            let capture = unsafe { release_mouse(window, userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
 
@@ -1904,7 +2021,14 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     state: Released,
                     button: Right,
-                    facts: mouse_input_facts(lparam),
+                    facts: mouse_input_facts(
+                        window,
+                        msg,
+                        wparam,
+                        lparam,
+                        PointerWindowRoute::Unknown,
+                        capture,
+                    ),
                 },
             });
             result = ProcResult::Value(0);
@@ -1925,7 +2049,14 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     state: Pressed,
                     button: Middle,
-                    facts: mouse_input_facts(lparam),
+                    facts: mouse_input_facts(
+                        window,
+                        msg,
+                        wparam,
+                        lparam,
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                    ),
                 },
             });
             result = ProcResult::Value(0);
@@ -1936,7 +2067,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Middle;
             use crate::event::WindowEvent::MouseInput;
 
-            unsafe { release_mouse(userdata.window_state_lock()) };
+            let capture = unsafe { release_mouse(window, userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
 
@@ -1946,7 +2077,14 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     state: Released,
                     button: Middle,
-                    facts: mouse_input_facts(lparam),
+                    facts: mouse_input_facts(
+                        window,
+                        msg,
+                        wparam,
+                        lparam,
+                        PointerWindowRoute::Unknown,
+                        capture,
+                    ),
                 },
             });
             result = ProcResult::Value(0);
@@ -1972,7 +2110,14 @@ unsafe fn public_window_callback_inner(
                         2 => Forward,
                         _ => Other(xbutton),
                     },
-                    facts: mouse_input_facts(lparam),
+                    facts: mouse_input_facts(
+                        window,
+                        msg,
+                        wparam,
+                        lparam,
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                        PointerWindowRoute::Window(RootWindowId(WindowId(window))),
+                    ),
                 },
             });
             result = ProcResult::Value(0);
@@ -1984,7 +2129,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::WindowEvent::MouseInput;
             let xbutton = super::get_xbutton_wparam(wparam as u32);
 
-            unsafe { release_mouse(userdata.window_state_lock()) };
+            let capture = unsafe { release_mouse(window, userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
 
@@ -1998,7 +2143,14 @@ unsafe fn public_window_callback_inner(
                         2 => Forward,
                         _ => Other(xbutton),
                     },
-                    facts: mouse_input_facts(lparam),
+                    facts: mouse_input_facts(
+                        window,
+                        msg,
+                        wparam,
+                        lparam,
+                        PointerWindowRoute::Unknown,
+                        capture,
+                    ),
                 },
             });
             result = ProcResult::Value(0);
@@ -2009,9 +2161,20 @@ unsafe fn public_window_callback_inner(
             // If it is the same as our window, then we're essentially retaining the capture. This
             // can happen if `SetCapture` is called on our window when it already has the mouse
             // capture.
-            if lparam != window {
+            let capture = if lparam == 0 {
+                PointerWindowRoute::None
+            } else if lparam == window {
+                PointerWindowRoute::Window(RootWindowId(WindowId(window)))
+            } else {
+                PointerWindowRoute::Foreign
+            };
+            if !matches!(capture, PointerWindowRoute::Window(_)) {
                 userdata.window_state_lock().mouse.capture_count = 0;
             }
+            userdata.send_event(Event::WindowEvent {
+                window_id: RootWindowId(WindowId(window)),
+                event: WindowEvent::PointerCaptureChanged { device_id: DEVICE_ID, capture },
+            });
             result = ProcResult::Value(0);
         },
 

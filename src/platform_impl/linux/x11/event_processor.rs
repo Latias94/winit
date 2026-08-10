@@ -22,7 +22,7 @@ use xkbcommon_dl::xkb_mod_mask_t;
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::event::{
     DeviceEvent, ElementState, Event, Ime, InnerSizeWriter, MouseButton, MouseScrollDelta,
-    PointerEventFacts, RawKeyEvent, Touch, TouchPhase, WindowEvent,
+    PointerEventFacts, PointerWindowRoute, RawKeyEvent, Touch, TouchPhase, WindowEvent,
 };
 use crate::event_loop::ActiveEventLoop as RootAEL;
 use crate::keyboard::ModifiersState;
@@ -680,10 +680,10 @@ impl EventProcessor {
             drop(shared_state_lock);
 
             if moved {
-                callback(&self.target, Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::Moved(outer.into()),
-                });
+                callback(
+                    &self.target,
+                    Event::WindowEvent { window_id, event: WindowEvent::Moved(outer.into()) },
+                );
             }
             outer
         };
@@ -728,13 +728,16 @@ impl EventProcessor {
                 drop(shared_state_lock);
 
                 let inner_size = Arc::new(Mutex::new(new_inner_size));
-                callback(&self.target, Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::ScaleFactorChanged {
-                        scale_factor: new_scale_factor,
-                        inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
+                callback(
+                    &self.target,
+                    Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::ScaleFactorChanged {
+                            scale_factor: new_scale_factor,
+                            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
+                        },
                     },
-                });
+                );
 
                 let new_inner_size = *inner_size.lock().unwrap();
                 drop(inner_size);
@@ -781,10 +784,13 @@ impl EventProcessor {
         }
 
         if resized {
-            callback(&self.target, Event::WindowEvent {
-                window_id,
-                event: WindowEvent::Resized(new_inner_size.into()),
-            });
+            callback(
+                &self.target,
+                Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::Resized(new_inner_size.into()),
+                },
+            );
         }
     }
 
@@ -1069,6 +1075,8 @@ impl EventProcessor {
             surface_position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
             desktop_position: Some(PhysicalPosition::new(event.root_x, event.root_y)),
             modifiers,
+            hover: PointerWindowRoute::Unknown,
+            capture: PointerWindowRoute::Unknown,
         };
         let event = match event.detail as u32 {
             xlib::Button1 => {
@@ -1141,7 +1149,17 @@ impl EventProcessor {
 
             let event = Event::WindowEvent {
                 window_id,
-                event: WindowEvent::CursorMoved { device_id, position },
+                event: WindowEvent::CursorMoved {
+                    device_id,
+                    position,
+                    facts: PointerEventFacts {
+                        surface_position: Some(position),
+                        desktop_position: Some(PhysicalPosition::new(event.root_x, event.root_y)),
+                        modifiers: None,
+                        hover: PointerWindowRoute::Unknown,
+                        capture: PointerWindowRoute::Unknown,
+                    },
+                },
             };
             callback(&self.target, event);
         } else if cursor_moved.is_none() {
@@ -1188,6 +1206,8 @@ impl EventProcessor {
                         surface_position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
                         desktop_position: Some(PhysicalPosition::new(event.root_x, event.root_y)),
                         modifiers,
+                        hover: PointerWindowRoute::Unknown,
+                        capture: PointerWindowRoute::Unknown,
                     },
                 }
             } else {
@@ -1243,7 +1263,17 @@ impl EventProcessor {
 
             let event = Event::WindowEvent {
                 window_id,
-                event: WindowEvent::CursorMoved { device_id, position },
+                event: WindowEvent::CursorMoved {
+                    device_id,
+                    position,
+                    facts: PointerEventFacts {
+                        surface_position: Some(position),
+                        desktop_position: None,
+                        modifiers: None,
+                        hover: PointerWindowRoute::Window(window_id),
+                        capture: PointerWindowRoute::None,
+                    },
+                },
             };
             callback(&self.target, event);
         }
@@ -1326,7 +1356,17 @@ impl EventProcessor {
 
         let event = Event::WindowEvent {
             window_id,
-            event: WindowEvent::CursorMoved { device_id: mkdid(pointer_id as _), position },
+            event: WindowEvent::CursorMoved {
+                device_id: mkdid(pointer_id as _),
+                position,
+                facts: PointerEventFacts {
+                    surface_position: Some(position),
+                    desktop_position: None,
+                    modifiers: None,
+                    hover: PointerWindowRoute::Unknown,
+                    capture: PointerWindowRoute::Unknown,
+                },
+            },
         };
         callback(&self.target, event);
     }
@@ -1410,6 +1450,13 @@ impl EventProcessor {
                     event: WindowEvent::CursorMoved {
                         device_id: mkdid(util::VIRTUAL_CORE_POINTER),
                         position: location.cast(),
+                        facts: PointerEventFacts {
+                            surface_position: Some(location.cast()),
+                            desktop_position: None,
+                            modifiers: None,
+                            hover: PointerWindowRoute::Unknown,
+                            capture: PointerWindowRoute::Unknown,
+                        },
                     },
                 };
                 callback(&self.target, event);
@@ -1531,10 +1578,13 @@ impl EventProcessor {
         }
         let physical_key = xkb::raw_keycode_to_physicalkey(keycode);
 
-        callback(&self.target, Event::DeviceEvent {
-            device_id,
-            event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
-        });
+        callback(
+            &self.target,
+            Event::DeviceEvent {
+                device_id,
+                event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
+            },
+        );
     }
 
     fn xinput2_hierarchy_changed<T: 'static, F>(&mut self, xev: &XIHierarchyEvent, mut callback: F)
@@ -1549,15 +1599,21 @@ impl EventProcessor {
         for info in infos {
             if 0 != info.flags & (xinput2::XISlaveAdded | xinput2::XIMasterAdded) {
                 self.init_device(info.deviceid as xinput::DeviceId);
-                callback(&self.target, Event::DeviceEvent {
-                    device_id: mkdid(info.deviceid as xinput::DeviceId),
-                    event: DeviceEvent::Added,
-                });
+                callback(
+                    &self.target,
+                    Event::DeviceEvent {
+                        device_id: mkdid(info.deviceid as xinput::DeviceId),
+                        event: DeviceEvent::Added,
+                    },
+                );
             } else if 0 != info.flags & (xinput2::XISlaveRemoved | xinput2::XIMasterRemoved) {
-                callback(&self.target, Event::DeviceEvent {
-                    device_id: mkdid(info.deviceid as xinput::DeviceId),
-                    event: DeviceEvent::Removed,
-                });
+                callback(
+                    &self.target,
+                    Event::DeviceEvent {
+                        device_id: mkdid(info.deviceid as xinput::DeviceId),
+                        event: DeviceEvent::Removed,
+                    },
+                );
                 let mut devices = self.devices.borrow_mut();
                 devices.remove(&DeviceId(info.deviceid as xinput::DeviceId));
             }

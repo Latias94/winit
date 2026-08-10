@@ -474,6 +474,7 @@ impl ApplicationHandler<UserEvent> for Application {
             | WindowEvent::AxisMotion { .. }
             | WindowEvent::DroppedFile(_)
             | WindowEvent::HoveredFile(_)
+            | WindowEvent::PointerCaptureChanged { .. }
             | WindowEvent::Destroyed
             | WindowEvent::Touch(_)
             | WindowEvent::Moved(_) => (),

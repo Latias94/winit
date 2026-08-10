@@ -1,5 +1,6 @@
 //! The pointer events.
 
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,7 +30,8 @@ use sctk::seat::SeatState;
 
 use crate::dpi::{LogicalPosition, PhysicalPosition};
 use crate::event::{
-    ElementState, MouseButton, MouseScrollDelta, PointerEventFacts, TouchPhase, WindowEvent,
+    ElementState, MouseButton, MouseScrollDelta, PointerEventFacts, PointerWindowRoute, TouchPhase,
+    WindowEvent,
 };
 
 use crate::platform_impl::wayland::state::WinitState;
@@ -135,8 +137,30 @@ impl PointerHandler for WinitState {
                     // Set the currently focused surface.
                     pointer.winit_data().inner.lock().unwrap().surface = Some(window_id);
 
+                    let route = crate::window::WindowId(window_id);
+                    let capture =
+                        if pointer.winit_data().inner.lock().unwrap().pressed_buttons.is_empty() {
+                            PointerWindowRoute::None
+                        } else {
+                            PointerWindowRoute::Window(route)
+                        };
+
                     self.events_sink.push_window_event(
-                        WindowEvent::CursorMoved { device_id, position },
+                        WindowEvent::CursorMoved {
+                            device_id,
+                            position,
+                            facts: PointerEventFacts {
+                                surface_position: Some(position),
+                                desktop_position: None,
+                                modifiers: None,
+                                hover: if matches!(capture, PointerWindowRoute::None) {
+                                    PointerWindowRoute::Window(route)
+                                } else {
+                                    PointerWindowRoute::Unknown
+                                },
+                                capture,
+                            },
+                        },
                         window_id,
                     );
                 },
@@ -150,15 +174,59 @@ impl PointerHandler for WinitState {
                         .push_window_event(WindowEvent::CursorLeft { device_id }, window_id);
                 },
                 PointerEventKind::Motion { .. } => {
+                    let route = crate::window::WindowId(window_id);
+                    let capture =
+                        if pointer.winit_data().inner.lock().unwrap().pressed_buttons.is_empty() {
+                            PointerWindowRoute::None
+                        } else {
+                            PointerWindowRoute::Window(route)
+                        };
                     self.events_sink.push_window_event(
-                        WindowEvent::CursorMoved { device_id, position },
+                        WindowEvent::CursorMoved {
+                            device_id,
+                            position,
+                            facts: PointerEventFacts {
+                                surface_position: Some(position),
+                                desktop_position: None,
+                                modifiers: None,
+                                hover: if matches!(capture, PointerWindowRoute::None) {
+                                    PointerWindowRoute::Window(route)
+                                } else {
+                                    PointerWindowRoute::Unknown
+                                },
+                                capture,
+                            },
+                        },
                         window_id,
                     );
                 },
                 ref kind @ PointerEventKind::Press { button, serial, .. }
                 | ref kind @ PointerEventKind::Release { button, serial, .. } => {
-                    // Update the last button serial.
-                    pointer.winit_data().inner.lock().unwrap().latest_button_serial = serial;
+                    // Update the last button serial and derive implicit pointer capture from the
+                    // same protocol event. Wayland does not expose a desktop-global hover point,
+                    // so a pressed pointer keeps capture exact while hover becomes unknown.
+                    let (hover, capture) = {
+                        let mut pointer_data = pointer.winit_data().inner.lock().unwrap();
+                        pointer_data.latest_button_serial = serial;
+                        if matches!(kind, PointerEventKind::Press { .. }) {
+                            pointer_data.pressed_buttons.insert(*button);
+                        } else {
+                            pointer_data.pressed_buttons.remove(button);
+                        }
+
+                        let route = PointerWindowRoute::Window(crate::window::WindowId(window_id));
+                        let capture = if pointer_data.pressed_buttons.is_empty() {
+                            PointerWindowRoute::None
+                        } else {
+                            route
+                        };
+                        let hover = if matches!(kind, PointerEventKind::Press { .. }) {
+                            route
+                        } else {
+                            PointerWindowRoute::Unknown
+                        };
+                        (hover, capture)
+                    };
 
                     let button = wayland_button_to_winit(button);
                     let state = if matches!(kind, PointerEventKind::Press { .. }) {
@@ -175,6 +243,8 @@ impl PointerHandler for WinitState {
                                 surface_position: Some(position),
                                 desktop_position: None,
                                 modifiers: None,
+                                hover,
+                                capture,
                             },
                         },
                         window_id,
@@ -204,6 +274,18 @@ impl PointerHandler for WinitState {
                     // Update the phase.
                     pointer_data.phase = phase;
 
+                    let route = PointerWindowRoute::Window(crate::window::WindowId(window_id));
+                    let capture = if pointer_data.pressed_buttons.is_empty() {
+                        PointerWindowRoute::None
+                    } else {
+                        route
+                    };
+                    let hover = if matches!(capture, PointerWindowRoute::None) {
+                        route
+                    } else {
+                        PointerWindowRoute::Unknown
+                    };
+
                     // Mice events have both pixel and discrete delta's at the same time. So prefer
                     // the discrete values if they are present.
                     let delta = if has_discrete_scroll {
@@ -229,6 +311,8 @@ impl PointerHandler for WinitState {
                                 surface_position: Some(position),
                                 desktop_position: None,
                                 modifiers: None,
+                                hover,
+                                capture,
                             },
                         },
                         window_id,
@@ -373,6 +457,10 @@ pub struct WinitPointerDataInner {
 
     /// Current axis phase.
     phase: TouchPhase,
+
+    /// Buttons currently held by the Wayland pointer seat. This is used only to report the
+    /// protocol's implicit capture owner; it is not a UI hit-test result.
+    pressed_buttons: HashSet<u32>,
 }
 
 impl Drop for WinitPointerDataInner {
@@ -395,6 +483,7 @@ impl Default for WinitPointerDataInner {
             confined_pointer: None,
             latest_button_serial: 0,
             phase: TouchPhase::Ended,
+            pressed_buttons: HashSet::new(),
         }
     }
 }
