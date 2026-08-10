@@ -44,7 +44,7 @@ use windows_sys::Win32::UI::Input::Touch::{
 use windows_sys::Win32::UI::Input::{RAWINPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMenu, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
+    GetMenu, GetMessagePos, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
     RegisterClassExW, RegisterWindowMessageA, SetCursor, SetWindowPos, TranslateMessage,
     CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT,
     MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, PT_PEN,
@@ -66,7 +66,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::error::EventLoopError;
 use crate::event::{
-    DeviceEvent, Event, Force, Ime, InnerSizeWriter, RawKeyEvent, Touch, TouchPhase, WindowEvent,
+    DeviceEvent, Event, Force, Ime, InnerSizeWriter, PointerEventFacts, RawKeyEvent, Touch,
+    TouchPhase, WindowEvent,
 };
 use crate::event_loop::{ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents, EventLoopClosed};
 use crate::keyboard::ModifiersState;
@@ -999,7 +1000,6 @@ fn normalize_pointer_pressure(pressure: u32) -> Option<Force> {
 }
 
 /// Emit a `ModifiersChanged` event whenever modifiers have changed.
-/// Returns the current modifier state
 fn update_modifiers(window: HWND, userdata: &WindowData) {
     use crate::event::WindowEvent::ModifiersChanged;
 
@@ -1019,6 +1019,52 @@ fn update_modifiers(window: HWND, userdata: &WindowData) {
             window_id: RootWindowId(WindowId(window)),
             event: ModifiersChanged(modifiers.into()),
         });
+    }
+}
+
+fn wheel_surface_position(window: HWND, lparam: LPARAM) -> Option<PhysicalPosition<f64>> {
+    let mut position = POINT {
+        x: super::get_x_lparam(lparam as u32) as i32,
+        y: super::get_y_lparam(lparam as u32) as i32,
+    };
+    if unsafe { ScreenToClient(window, &mut position) } == false.into() {
+        None
+    } else {
+        Some(PhysicalPosition::new(position.x as f64, position.y as f64))
+    }
+}
+
+fn wheel_event_facts(window: HWND, lparam: LPARAM) -> PointerEventFacts {
+    PointerEventFacts {
+        surface_position: wheel_surface_position(window, lparam),
+        desktop_position: Some(PhysicalPosition::new(
+            f64::from(super::get_x_lparam(lparam as u32)),
+            f64::from(super::get_y_lparam(lparam as u32)),
+        )),
+        // WM_MOUSEWHEEL reports only part of the keyboard modifier roster. Do not combine that
+        // partial event-time state with callback-time keyboard queries and call it exact.
+        modifiers: None,
+    }
+}
+
+fn desktop_message_position() -> Option<PhysicalPosition<f64>> {
+    let position = unsafe { GetMessagePos() };
+    (position != u32::MAX).then(|| {
+        PhysicalPosition::new(
+            f64::from(super::get_x_lparam(position)),
+            f64::from(super::get_y_lparam(position)),
+        )
+    })
+}
+
+fn mouse_input_facts(lparam: LPARAM) -> PointerEventFacts {
+    PointerEventFacts {
+        surface_position: Some(PhysicalPosition::new(
+            f64::from(super::get_x_lparam(lparam as u32)),
+            f64::from(super::get_y_lparam(lparam as u32)),
+        )),
+        desktop_position: desktop_message_position(),
+        modifiers: None,
     }
 }
 
@@ -1738,6 +1784,7 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     delta: LineDelta(0.0, value),
                     phase: TouchPhase::Moved,
+                    facts: wheel_event_facts(window, lparam),
                 },
             });
 
@@ -1758,6 +1805,7 @@ unsafe fn public_window_callback_inner(
                     device_id: DEVICE_ID,
                     delta: LineDelta(value, 0.0),
                     phase: TouchPhase::Moved,
+                    facts: wheel_event_facts(window, lparam),
                 },
             });
 
@@ -1789,7 +1837,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Left },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Pressed,
+                    button: Left,
+                    facts: mouse_input_facts(lparam),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1805,7 +1858,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Left },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Released,
+                    button: Left,
+                    facts: mouse_input_facts(lparam),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1821,7 +1879,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Right },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Pressed,
+                    button: Right,
+                    facts: mouse_input_facts(lparam),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1837,7 +1900,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Right },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Released,
+                    button: Right,
+                    facts: mouse_input_facts(lparam),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1853,7 +1921,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Pressed, button: Middle },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Pressed,
+                    button: Middle,
+                    facts: mouse_input_facts(lparam),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1869,7 +1942,12 @@ unsafe fn public_window_callback_inner(
 
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
-                event: MouseInput { device_id: DEVICE_ID, state: Released, button: Middle },
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state: Released,
+                    button: Middle,
+                    facts: mouse_input_facts(lparam),
+                },
             });
             result = ProcResult::Value(0);
         },
@@ -1894,6 +1972,7 @@ unsafe fn public_window_callback_inner(
                         2 => Forward,
                         _ => Other(xbutton),
                     },
+                    facts: mouse_input_facts(lparam),
                 },
             });
             result = ProcResult::Value(0);
@@ -1919,6 +1998,7 @@ unsafe fn public_window_callback_inner(
                         2 => Forward,
                         _ => Other(xbutton),
                     },
+                    facts: mouse_input_facts(lparam),
                 },
             });
             result = ProcResult::Value(0);

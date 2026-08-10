@@ -14,7 +14,8 @@ use super::runner::{EventWrapper, Execution};
 use super::window::WindowId;
 use super::{backend, runner};
 use crate::event::{
-    DeviceId as RootDeviceId, ElementState, Event, KeyEvent, Touch, TouchPhase, WindowEvent,
+    DeviceId as RootDeviceId, ElementState, Event, KeyEvent, PointerEventFacts, Touch, TouchPhase,
+    WindowEvent,
 };
 use crate::event_loop::{ControlFlow, DeviceEvents};
 use crate::keyboard::ModifiersState;
@@ -349,7 +350,16 @@ impl ActiveEventLoop {
                         },
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
-                            event: WindowEvent::MouseInput { device_id, state, button },
+                            event: WindowEvent::MouseInput {
+                                device_id,
+                                state,
+                                button,
+                                facts: PointerEventFacts {
+                                    surface_position: Some(position),
+                                    desktop_position: None,
+                                    modifiers: Some(active_modifiers),
+                                },
+                            },
                         },
                     ]));
                 }
@@ -386,6 +396,11 @@ impl ActiveEventLoop {
                                 device_id,
                                 state: ElementState::Pressed,
                                 button,
+                                facts: PointerEventFacts {
+                                    surface_position: Some(position),
+                                    desktop_position: None,
+                                    modifiers: Some(active_modifiers),
+                                },
                             },
                         },
                     ]));
@@ -452,6 +467,11 @@ impl ActiveEventLoop {
                                 device_id,
                                 state: ElementState::Released,
                                 button,
+                                facts: PointerEventFacts {
+                                    surface_position: Some(position),
+                                    desktop_position: None,
+                                    modifiers: Some(active_modifiers),
+                                },
                             },
                         },
                     ]));
@@ -490,7 +510,7 @@ impl ActiveEventLoop {
 
         let runner = self.runner.clone();
         let modifiers = self.modifiers.clone();
-        canvas.on_mouse_wheel(move |pointer_id, delta, active_modifiers| {
+        canvas.on_mouse_wheel(move |pointer_id, delta, active_modifiers, position| {
             let modifiers_changed =
                 (has_focus.get() && modifiers.get() != active_modifiers).then(|| {
                     modifiers.set(active_modifiers);
@@ -507,6 +527,11 @@ impl ActiveEventLoop {
                         device_id: RootDeviceId(DeviceId(pointer_id)),
                         delta,
                         phase: TouchPhase::Moved,
+                        facts: PointerEventFacts {
+                            surface_position: Some(position),
+                            desktop_position: None,
+                            modifiers: Some(active_modifiers),
+                        },
                     },
                 },
             )));

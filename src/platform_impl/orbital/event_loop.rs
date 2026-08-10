@@ -432,6 +432,7 @@ impl<T: 'static> EventLoop<T> {
                             device_id: event::DeviceId(DeviceId),
                             state,
                             button,
+                            facts: event::PointerEventFacts::default(),
                         },
                     });
                 }
@@ -443,6 +444,7 @@ impl<T: 'static> EventLoop<T> {
                         device_id: event::DeviceId(DeviceId),
                         delta: event::MouseScrollDelta::LineDelta(x as f32, y as f32),
                         phase: event::TouchPhase::Moved,
+                        facts: event::PointerEventFacts::default(),
                     },
                 });
             },

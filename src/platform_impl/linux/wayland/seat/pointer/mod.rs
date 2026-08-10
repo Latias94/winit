@@ -28,7 +28,9 @@ use sctk::seat::pointer::{
 use sctk::seat::SeatState;
 
 use crate::dpi::{LogicalPosition, PhysicalPosition};
-use crate::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use crate::event::{
+    ElementState, MouseButton, MouseScrollDelta, PointerEventFacts, TouchPhase, WindowEvent,
+};
 
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{self, DeviceId, WindowId};
@@ -165,7 +167,16 @@ impl PointerHandler for WinitState {
                         ElementState::Released
                     };
                     self.events_sink.push_window_event(
-                        WindowEvent::MouseInput { device_id, state, button },
+                        WindowEvent::MouseInput {
+                            device_id,
+                            state,
+                            button,
+                            facts: PointerEventFacts {
+                                surface_position: Some(position),
+                                desktop_position: None,
+                                modifiers: None,
+                            },
+                        },
                         window_id,
                     );
                 },
@@ -210,7 +221,16 @@ impl PointerHandler for WinitState {
                     };
 
                     self.events_sink.push_window_event(
-                        WindowEvent::MouseWheel { device_id, delta, phase },
+                        WindowEvent::MouseWheel {
+                            device_id,
+                            delta,
+                            phase,
+                            facts: PointerEventFacts {
+                                surface_position: Some(position),
+                                desktop_position: None,
+                                modifiers: None,
+                            },
+                        },
                         window_id,
                     )
                 },

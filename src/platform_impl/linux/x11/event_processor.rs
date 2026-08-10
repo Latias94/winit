@@ -22,7 +22,7 @@ use xkbcommon_dl::xkb_mod_mask_t;
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::event::{
     DeviceEvent, ElementState, Event, Ime, InnerSizeWriter, MouseButton, MouseScrollDelta,
-    RawKeyEvent, Touch, TouchPhase, WindowEvent,
+    PointerEventFacts, RawKeyEvent, Touch, TouchPhase, WindowEvent,
 };
 use crate::event_loop::ActiveEventLoop as RootAEL;
 use crate::keyboard::ModifiersState;
@@ -223,23 +223,23 @@ impl EventProcessor {
                         };
 
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
-                        self.update_mods_from_xinput2_event(
+                        let modifiers = self.update_mods_from_xinput2_event(
                             &xev.mods,
                             &xev.group,
                             false,
                             &mut callback,
                         );
-                        self.xinput2_button_input(xev, state, &mut callback);
+                        self.xinput2_button_input(xev, state, modifiers, &mut callback);
                     },
                     xinput2::XI_Motion => {
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
-                        self.update_mods_from_xinput2_event(
+                        let modifiers = self.update_mods_from_xinput2_event(
                             &xev.mods,
                             &xev.group,
                             false,
                             &mut callback,
                         );
-                        self.xinput2_mouse_motion(xev, &mut callback);
+                        self.xinput2_mouse_motion(xev, modifiers, &mut callback);
                     },
                     xinput2::XI_Enter => {
                         let xev: &XIEnterEvent = unsafe { xev.as_event() };
@@ -247,7 +247,7 @@ impl EventProcessor {
                     },
                     xinput2::XI_Leave => {
                         let xev: &XILeaveEvent = unsafe { xev.as_event() };
-                        self.update_mods_from_xinput2_event(
+                        let _ = self.update_mods_from_xinput2_event(
                             &xev.mods,
                             &xev.group,
                             false,
@@ -1048,6 +1048,7 @@ impl EventProcessor {
         &self,
         event: &XIDeviceEvent,
         state: ElementState,
+        modifiers: Option<ModifiersState>,
         mut callback: F,
     ) where
         F: FnMut(&RootAEL, Event<T>),
@@ -1064,16 +1065,21 @@ impl EventProcessor {
             return;
         }
 
+        let facts = PointerEventFacts {
+            surface_position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
+            desktop_position: Some(PhysicalPosition::new(event.root_x, event.root_y)),
+            modifiers,
+        };
         let event = match event.detail as u32 {
             xlib::Button1 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Left }
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Left, facts }
             },
             xlib::Button2 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle }
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle, facts }
             },
 
             xlib::Button3 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Right }
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Right, facts }
             },
 
             // Suppress emulated scroll wheel clicks, since we handle the real motion events for
@@ -1090,19 +1096,29 @@ impl EventProcessor {
                     _ => unreachable!(),
                 },
                 phase: TouchPhase::Moved,
+                facts,
             },
-            8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back },
+            8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back, facts },
 
-            9 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Forward },
-            x => WindowEvent::MouseInput { device_id, state, button: MouseButton::Other(x as u16) },
+            9 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Forward, facts },
+            x => WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Other(x as u16),
+                facts,
+            },
         };
 
         let event = Event::WindowEvent { window_id, event };
         callback(&self.target, event);
     }
 
-    fn xinput2_mouse_motion<T: 'static, F>(&self, event: &XIDeviceEvent, mut callback: F)
-    where
+    fn xinput2_mouse_motion<T: 'static, F>(
+        &self,
+        event: &XIDeviceEvent,
+        modifiers: Option<ModifiersState>,
+        mut callback: F,
+    ) where
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
@@ -1164,7 +1180,16 @@ impl EventProcessor {
                     ScrollOrientation::Vertical => MouseScrollDelta::LineDelta(0.0, -delta as f32),
                 };
 
-                WindowEvent::MouseWheel { device_id, delta, phase: TouchPhase::Moved }
+                WindowEvent::MouseWheel {
+                    device_id,
+                    delta,
+                    phase: TouchPhase::Moved,
+                    facts: PointerEventFacts {
+                        surface_position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
+                        desktop_position: Some(PhysicalPosition::new(event.root_x, event.root_y)),
+                        modifiers,
+                    },
+                }
             } else {
                 WindowEvent::AxisMotion { device_id, axis: i as u32, value: unsafe { *value } }
             };
@@ -1624,10 +1649,11 @@ impl EventProcessor {
         group: &XIModifierState,
         force: bool,
         mut callback: F,
-    ) where
+    ) -> Option<ModifiersState>
+    where
         F: FnMut(&RootAEL, Event<T>),
     {
-        if let Some(state) = self.xkb_context.state_mut() {
+        let modifiers = if let Some(state) = self.xkb_context.state_mut() {
             state.update_modifiers(
                 mods.base as u32,
                 mods.latched as u32,
@@ -1636,17 +1662,20 @@ impl EventProcessor {
                 group.latched as u32,
                 group.locked as u32,
             );
+            Some(state.modifiers().into())
+        } else {
+            None
+        };
 
-            // NOTE: we use active window since generally sub windows don't have keyboard input,
-            // and winit assumes that unfocused window doesn't have modifiers.
-            let window_id = match self.active_window.map(super::mkwid) {
-                Some(window_id) => window_id,
-                None => return,
-            };
-
-            let mods = state.modifiers();
-            self.send_modifiers(window_id, mods.into(), force, &mut callback);
+        // NOTE: we use active window since generally sub windows don't have keyboard input,
+        // and winit assumes that unfocused window doesn't have modifiers.
+        if let (Some(window_id), Some(modifiers)) =
+            (self.active_window.map(super::mkwid), modifiers)
+        {
+            self.send_modifiers(window_id, modifiers, force, &mut callback);
         }
+
+        modifiers
     }
 
     fn update_mods_from_query<T: 'static, F>(

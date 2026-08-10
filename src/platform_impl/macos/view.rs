@@ -1,11 +1,14 @@
 #![allow(clippy::unnecessary_cast)]
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::ffi::c_void;
 use std::ptr;
 
+use core_graphics::geometry::CGPoint;
+use core_graphics::sys::CGEventRef;
 use objc2::rc::{Retained, WeakId};
 use objc2::runtime::{AnyObject, Sel};
-use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
     NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
@@ -24,13 +27,18 @@ use super::event::{
 };
 use super::window::WinitWindow;
 use super::DEVICE_ID;
-use crate::dpi::{LogicalPosition, LogicalSize};
+use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use crate::event::{
-    DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, TouchPhase,
-    WindowEvent,
+    DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta,
+    PointerEventFacts, TouchPhase, WindowEvent,
 };
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
 use crate::platform::macos::OptionAsAlt;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+}
 
 #[derive(Debug)]
 struct CursorState {
@@ -697,6 +705,7 @@ declare_class!(
                 device_id: DEVICE_ID,
                 delta,
                 phase,
+                facts: self.pointer_event_facts(event),
             });
         }
 
@@ -1055,12 +1064,12 @@ impl WinitView {
             device_id: DEVICE_ID,
             state: button_state,
             button,
+            facts: self.pointer_event_facts(event),
         });
     }
 
     fn mouse_motion(&self, event: &NSEvent) {
-        let window_point = unsafe { event.locationInWindow() };
-        let view_point = self.convertPoint_fromView(window_point, None);
+        let view_point = self.event_logical_position(event);
         let frame = self.frame();
 
         if view_point.x.is_sign_negative()
@@ -1075,8 +1084,6 @@ impl WinitView {
             }
         }
 
-        let view_point = LogicalPosition::new(view_point.x, view_point.y);
-
         self.update_modifiers(event, false);
 
         self.queue_event(WindowEvent::CursorMoved {
@@ -1084,6 +1091,34 @@ impl WinitView {
             position: view_point.to_physical(self.scale_factor()),
         });
     }
+
+    fn event_position(&self, event: &NSEvent) -> PhysicalPosition<f64> {
+        self.event_logical_position(event).to_physical(self.scale_factor())
+    }
+
+    fn pointer_event_facts(&self, event: &NSEvent) -> PointerEventFacts {
+        PointerEventFacts {
+            surface_position: Some(self.event_position(event)),
+            desktop_position: event_desktop_position(event),
+            modifiers: Some(event_mods(event).state()),
+        }
+    }
+
+    fn event_logical_position(&self, event: &NSEvent) -> LogicalPosition<f64> {
+        let window_point = unsafe { event.locationInWindow() };
+        let view_point = self.convertPoint_fromView(window_point, None);
+        LogicalPosition::new(view_point.x, view_point.y)
+    }
+}
+
+fn event_desktop_position(event: &NSEvent) -> Option<PhysicalPosition<f64>> {
+    let cg_event: *mut c_void = unsafe { msg_send![event, CGEvent] };
+    if cg_event.is_null() {
+        return None;
+    }
+
+    let point = unsafe { CGEventGetLocation(cg_event.cast()) };
+    Some(PhysicalPosition::new(point.x, point.y))
 }
 
 /// Get the mouse button from the NSEvent.

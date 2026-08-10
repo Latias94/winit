@@ -147,6 +147,29 @@ pub enum StartCause {
     Init,
 }
 
+/// Exact facts carried by the native event that produced a pointer input event.
+///
+/// A missing field means that the platform backend could not report that fact from the same
+/// native event or callback. Consumers must not reconstruct missing values from cached cursor,
+/// modifier, or window geometry state.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PointerEventFacts {
+    /// The event position in physical pixels relative to the top-left corner of the event window's
+    /// content area.
+    pub surface_position: Option<PhysicalPosition<f64>>,
+
+    /// The event position in the platform's native global desktop coordinate space.
+    ///
+    /// The [`WindowId`] attached to the enclosing [`Event::WindowEvent`] identifies the delivery
+    /// window. It does not imply that this desktop position is hovering that window. Platforms
+    /// with per-display scaling may use a virtual desktop coordinate space, so consumers must
+    /// interpret this value together with the platform's display facts.
+    pub desktop_position: Option<PhysicalPosition<f64>>,
+
+    /// The complete modifier state reported by the same native event or callback.
+    pub modifiers: Option<ModifiersState>,
+}
+
 /// Describes an event from a [`Window`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum WindowEvent {
@@ -272,10 +295,22 @@ pub enum WindowEvent {
     CursorLeft { device_id: DeviceId },
 
     /// A mouse wheel movement or touchpad scroll occurred.
-    MouseWheel { device_id: DeviceId, delta: MouseScrollDelta, phase: TouchPhase },
+    MouseWheel {
+        device_id: DeviceId,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+        /// Facts captured from the native event that produced this wheel update.
+        facts: PointerEventFacts,
+    },
 
-    /// An mouse button press has been received.
-    MouseInput { device_id: DeviceId, state: ElementState, button: MouseButton },
+    /// A mouse button press or release has been received.
+    MouseInput {
+        device_id: DeviceId,
+        state: ElementState,
+        button: MouseButton,
+        /// Facts captured from the native event that produced this button edge.
+        facts: PointerEventFacts,
+    },
 
     /// Two-finger pinch gesture, often used for magnification.
     ///
@@ -1055,11 +1090,13 @@ mod tests {
                     device_id: did,
                     delta: event::MouseScrollDelta::LineDelta(0.0, 0.0),
                     phase: event::TouchPhase::Started,
+                    facts: event::PointerEventFacts::default(),
                 });
                 with_window_event(MouseInput {
                     device_id: did,
                     state: event::ElementState::Pressed,
                     button: event::MouseButton::Other(0),
+                    facts: event::PointerEventFacts::default(),
                 });
                 with_window_event(PinchGesture {
                     device_id: did,
