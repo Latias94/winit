@@ -209,9 +209,9 @@ impl PointerHandler for WinitState {
                         let mut pointer_data = pointer.winit_data().inner.lock().unwrap();
                         pointer_data.latest_button_serial = serial;
                         if matches!(kind, PointerEventKind::Press { .. }) {
-                            pointer_data.pressed_buttons.insert(*button);
+                            pointer_data.pressed_buttons.insert(button);
                         } else {
-                            pointer_data.pressed_buttons.remove(button);
+                            pointer_data.pressed_buttons.remove(&button);
                         }
 
                         let route = PointerWindowRoute::Window(crate::window::WindowId(window_id));
