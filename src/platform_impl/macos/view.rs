@@ -1,7 +1,6 @@
 #![allow(clippy::unnecessary_cast)]
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::ffi::c_void;
 use std::ptr;
 
 use core_graphics::geometry::CGPoint;
@@ -1153,12 +1152,12 @@ impl WinitView {
 }
 
 fn event_desktop_position(event: &NSEvent) -> Option<PhysicalPosition<f64>> {
-    let cg_event: *mut c_void = unsafe { msg_send![event, CGEvent] };
+    let cg_event: CGEventRef = unsafe { msg_send![event, CGEvent] };
     if cg_event.is_null() {
         return None;
     }
 
-    let point = unsafe { CGEventGetLocation(cg_event.cast()) };
+    let point = unsafe { CGEventGetLocation(cg_event) };
     Some(PhysicalPosition::new(point.x, point.y))
 }
 
