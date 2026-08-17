@@ -5,6 +5,7 @@ use std::ptr;
 
 use core_graphics::geometry::CGPoint;
 use core_graphics::sys::CGEventRef;
+use objc2::encode::{Encoding, RefEncode};
 use objc2::rc::{Retained, WeakId};
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
@@ -38,6 +39,16 @@ use crate::window::WindowId as RootWindowId;
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+}
+
+#[repr(C)]
+struct EncodedCGEvent {
+    _priv: [u8; 0],
+}
+
+// SAFETY: `CGEventRef` is a pointer to CoreGraphics' opaque `__CGEvent` type.
+unsafe impl RefEncode for EncodedCGEvent {
+    const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("__CGEvent", &[]));
 }
 
 #[derive(Debug)]
@@ -1152,12 +1163,12 @@ impl WinitView {
 }
 
 fn event_desktop_position(event: &NSEvent) -> Option<PhysicalPosition<f64>> {
-    let cg_event: CGEventRef = unsafe { msg_send![event, CGEvent] };
+    let cg_event: *mut EncodedCGEvent = unsafe { msg_send![event, CGEvent] };
     if cg_event.is_null() {
         return None;
     }
 
-    let point = unsafe { CGEventGetLocation(cg_event) };
+    let point = unsafe { CGEventGetLocation(cg_event.cast()) };
     Some(PhysicalPosition::new(point.x, point.y))
 }
 
