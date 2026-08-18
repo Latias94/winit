@@ -11,7 +11,7 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
-    NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
+    NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification, NSWindow,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying,
@@ -133,6 +133,7 @@ pub struct ViewState {
     app_delegate: Retained<ApplicationDelegate>,
 
     cursor_state: RefCell<CursorState>,
+    pressed_mouse_buttons: Cell<NSUInteger>,
     ime_position: Cell<NSPoint>,
     ime_size: Cell<NSSize>,
     modifiers: Cell<Modifiers>,
@@ -716,7 +717,7 @@ declare_class!(
                 device_id: DEVICE_ID,
                 delta,
                 phase,
-                facts: self.pointer_event_facts(event),
+                facts: self.pointer_event_facts(event, self.scroll_capture_route()),
             });
         }
 
@@ -814,6 +815,7 @@ impl WinitView {
         let this = mtm.alloc().set_ivars(ViewState {
             app_delegate: app_delegate.retain(),
             cursor_state: Default::default(),
+            pressed_mouse_buttons: Default::default(),
             ime_position: Default::default(),
             ime_size: Default::default(),
             modifiers: Default::default(),
@@ -1068,6 +1070,16 @@ impl WinitView {
 
     fn mouse_click(&self, event: &NSEvent, button_state: ElementState) {
         let button = mouse_button(event);
+        let delivery = RootWindowId(self.window().id());
+        let capture = update_pressed_mouse_buttons(
+            self.ivars().pressed_mouse_buttons.get(),
+            unsafe { event.buttonNumber() },
+            button_state,
+        )
+        .map_or(PointerWindowRoute::Unknown, |pressed_buttons| {
+            self.ivars().pressed_mouse_buttons.set(pressed_buttons);
+            pointer_capture_route(pressed_buttons, delivery)
+        });
 
         self.update_modifiers(event, false);
 
@@ -1075,7 +1087,7 @@ impl WinitView {
             device_id: DEVICE_ID,
             state: button_state,
             button,
-            facts: self.pointer_event_facts(event),
+            facts: self.pointer_event_facts(event, capture),
         });
     }
 
@@ -1097,10 +1109,12 @@ impl WinitView {
 
         self.update_modifiers(event, false);
 
+        let delivery = RootWindowId(self.window().id());
+        let capture = pointer_capture_route(self.ivars().pressed_mouse_buttons.get(), delivery);
         self.queue_event(WindowEvent::CursorMoved {
             device_id: DEVICE_ID,
             position: view_point.to_physical(self.scale_factor()),
-            facts: self.cursor_moved_facts(view_point),
+            facts: self.cursor_moved_facts(event, view_point, capture),
         });
     }
 
@@ -1108,51 +1122,70 @@ impl WinitView {
         self.event_logical_position(event).to_physical(self.scale_factor())
     }
 
-    fn pointer_event_facts(&self, event: &NSEvent) -> PointerEventFacts {
+    fn pointer_event_facts(
+        &self,
+        event: &NSEvent,
+        capture: PointerWindowRoute,
+    ) -> PointerEventFacts {
         let position = self.event_position(event);
-        let hover = if unsafe { NSEvent::pressedMouseButtons() } == 0
-            && self.point_is_inside_view(position)
-        {
-            PointerWindowRoute::Window(RootWindowId(self.window().id()))
-        } else {
-            PointerWindowRoute::Unknown
-        };
 
         PointerEventFacts {
             surface_position: Some(position),
             desktop_position: event_desktop_position(event),
             modifiers: Some(event_mods(event).state()),
-            hover,
-            capture: PointerWindowRoute::Unknown,
+            hover: self.pointer_hover_route(event),
+            capture,
         }
     }
 
-    fn cursor_moved_facts(&self, position: LogicalPosition<f64>) -> PointerEventFacts {
+    fn cursor_moved_facts(
+        &self,
+        event: &NSEvent,
+        position: LogicalPosition<f64>,
+        capture: PointerWindowRoute,
+    ) -> PointerEventFacts {
         let position = position.to_physical(self.scale_factor());
-        let hover = if unsafe { NSEvent::pressedMouseButtons() } == 0
-            && self.point_is_inside_view(position)
-        {
-            PointerWindowRoute::Window(RootWindowId(self.window().id()))
-        } else {
-            PointerWindowRoute::Unknown
-        };
 
         PointerEventFacts {
             surface_position: Some(position),
-            desktop_position: None,
-            modifiers: None,
-            hover,
-            capture: PointerWindowRoute::Unknown,
+            desktop_position: event_desktop_position(event),
+            modifiers: Some(event_mods(event).state()),
+            hover: self.pointer_hover_route(event),
+            capture,
         }
     }
 
-    fn point_is_inside_view(&self, position: PhysicalPosition<f64>) -> bool {
-        let frame = self.frame();
-        let scale = self.scale_factor();
-        position.x >= 0.0
-            && position.y >= 0.0
-            && position.x <= frame.size.width * scale
-            && position.y <= frame.size.height * scale
+    fn scroll_capture_route(&self) -> PointerWindowRoute {
+        let delivery = RootWindowId(self.window().id());
+        let local_buttons = self.ivars().pressed_mouse_buttons.get();
+        if local_buttons != 0 {
+            return PointerWindowRoute::Window(delivery);
+        }
+
+        if unsafe { NSEvent::pressedMouseButtons() } == 0 {
+            PointerWindowRoute::None
+        } else {
+            PointerWindowRoute::Unknown
+        }
+    }
+
+    fn pointer_hover_route(&self, event: &NSEvent) -> PointerWindowRoute {
+        let mtm = MainThreadMarker::from(self);
+        let window_point = unsafe { event.locationInWindow() };
+        let screen_point = unsafe { self.window().convertPointToScreen(window_point) };
+        let frontmost = unsafe {
+            NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(screen_point, 0, mtm)
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        classify_pointer_window_route(
+            frontmost,
+            app.windows().into_iter().filter_map(|window| {
+                window.is_kind_of::<WinitWindow>().then(|| {
+                    let platform_id = super::window::WindowId(Retained::as_ptr(&window) as usize);
+                    (unsafe { window.windowNumber() }, RootWindowId(platform_id))
+                })
+            }),
+        )
     }
 
     fn event_logical_position(&self, event: &NSEvent) -> LogicalPosition<f64> {
@@ -1160,6 +1193,46 @@ impl WinitView {
         let view_point = self.convertPoint_fromView(window_point, None);
         LogicalPosition::new(view_point.x, view_point.y)
     }
+}
+
+fn classify_pointer_window_route(
+    frontmost: isize,
+    winit_windows: impl IntoIterator<Item = (isize, RootWindowId)>,
+) -> PointerWindowRoute {
+    if frontmost == 0 {
+        return PointerWindowRoute::None;
+    }
+
+    winit_windows
+        .into_iter()
+        .find_map(|(window_number, window_id)| {
+            (window_number == frontmost).then_some(PointerWindowRoute::Window(window_id))
+        })
+        .unwrap_or(PointerWindowRoute::Foreign)
+}
+
+fn pointer_capture_route(
+    pressed_buttons: NSUInteger,
+    delivery: RootWindowId,
+) -> PointerWindowRoute {
+    if pressed_buttons == 0 {
+        PointerWindowRoute::None
+    } else {
+        PointerWindowRoute::Window(delivery)
+    }
+}
+
+fn update_pressed_mouse_buttons(
+    pressed_buttons: NSUInteger,
+    button_number: isize,
+    state: ElementState,
+) -> Option<NSUInteger> {
+    let button_number = u32::try_from(button_number).ok()?;
+    let button_mask = 1_usize.checked_shl(button_number)?;
+    Some(match state {
+        ElementState::Pressed => pressed_buttons | button_mask,
+        ElementState::Released => pressed_buttons & !button_mask,
+    })
 }
 
 fn event_desktop_position(event: &NSEvent) -> Option<PhysicalPosition<f64>> {
@@ -1224,5 +1297,53 @@ fn replace_event(event: &NSEvent, option_as_alt: OptionAsAlt) -> Retained<NSEven
         }
     } else {
         event.copy()
+    }
+}
+
+#[cfg(test)]
+mod pointer_route_tests {
+    use super::*;
+
+    #[test]
+    fn frontmost_winit_window_is_reported_exactly() {
+        let first = RootWindowId(super::super::window::WindowId(1));
+        let second = RootWindowId(super::super::window::WindowId(2));
+
+        assert_eq!(
+            classify_pointer_window_route(20, [(10, first), (20, second)]),
+            PointerWindowRoute::Window(second)
+        );
+    }
+
+    #[test]
+    fn desktop_and_foreign_windows_remain_distinct() {
+        let managed = RootWindowId(super::super::window::WindowId(1));
+
+        assert_eq!(classify_pointer_window_route(0, [(10, managed)]), PointerWindowRoute::None);
+        assert_eq!(classify_pointer_window_route(99, [(10, managed)]), PointerWindowRoute::Foreign);
+    }
+
+    #[test]
+    fn capture_follows_post_event_pressed_button_state() {
+        let delivery = RootWindowId(super::super::window::WindowId(1));
+
+        assert_eq!(pointer_capture_route(1, delivery), PointerWindowRoute::Window(delivery));
+        assert_eq!(pointer_capture_route(0, delivery), PointerWindowRoute::None);
+    }
+
+    #[test]
+    fn button_transitions_preserve_other_capture_buttons() {
+        let first = update_pressed_mouse_buttons(0, 0, ElementState::Pressed).unwrap();
+        let second = update_pressed_mouse_buttons(first, 1, ElementState::Pressed).unwrap();
+        let released_first =
+            update_pressed_mouse_buttons(second, 0, ElementState::Released).unwrap();
+        let released_second =
+            update_pressed_mouse_buttons(released_first, 1, ElementState::Released).unwrap();
+
+        assert_eq!(first, 0b01);
+        assert_eq!(second, 0b11);
+        assert_eq!(released_first, 0b10);
+        assert_eq!(released_second, 0);
+        assert_eq!(update_pressed_mouse_buttons(0, -1, ElementState::Pressed), None);
     }
 }
