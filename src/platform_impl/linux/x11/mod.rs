@@ -43,6 +43,7 @@ mod event_processor;
 pub mod ffi;
 mod ime;
 mod monitor;
+mod pointer_facts;
 mod util;
 mod window;
 mod xdisplay;
@@ -329,6 +330,7 @@ impl<T: 'static> EventLoop<T> {
             active_window: None,
             modifiers: Default::default(),
             is_composing: false,
+            pointer_captures: Default::default(),
         };
 
         // Register for device hotplug events
