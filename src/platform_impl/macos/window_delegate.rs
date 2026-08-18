@@ -151,6 +151,7 @@ declare_class!(
         #[method(windowWillClose:)]
         fn window_will_close(&self, _: Option<&AnyObject>) {
             trace_scope!("windowWillClose:");
+            self.view().reset_pointer_capture();
             // `setDelegate:` retains the previous value and then autoreleases it
             autoreleasepool(|_| {
                 // Since El Capitan, we need to be careful that delegate methods can't
@@ -802,8 +803,7 @@ impl WindowDelegate {
 
     #[track_caller]
     pub(super) fn view(&self) -> Retained<WinitView> {
-        // SAFETY: The view inside WinitWindow is always `WinitView`
-        unsafe { Retained::cast(self.window().contentView().unwrap()) }
+        self.window().view()
     }
 
     #[track_caller]
@@ -1172,6 +1172,7 @@ impl WindowDelegate {
         let event =
             NSApplication::sharedApplication(mtm).currentEvent().ok_or(ExternalError::Ignored)?;
         self.window().performWindowDragWithEvent(&event);
+        self.view().reset_pointer_capture();
         Ok(())
     }
 

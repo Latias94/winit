@@ -3,7 +3,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
 
-use core_graphics::geometry::CGPoint;
+use core_graphics::display::CGDisplay;
+use core_graphics::geometry::{CGPoint, CGRect};
 use core_graphics::sys::CGEventRef;
 use objc2::encode::{Encoding, RefEncode};
 use objc2::rc::{Retained, WeakId};
@@ -27,7 +28,7 @@ use super::event::{
 };
 use super::window::WinitWindow;
 use super::DEVICE_ID;
-use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
+use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use crate::event::{
     DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta,
     PointerEventFacts, PointerWindowRoute, TouchPhase, WindowEvent,
@@ -932,6 +933,17 @@ impl WinitView {
         }
     }
 
+    /// Terminates this view's implicit mouse capture after the platform stops
+    /// delivering the corresponding button sequence.
+    pub(super) fn reset_pointer_capture(&self) {
+        if clear_pressed_mouse_buttons(&self.ivars().pressed_mouse_buttons) {
+            self.queue_event(WindowEvent::PointerCaptureChanged {
+                device_id: DEVICE_ID,
+                capture: PointerWindowRoute::None,
+            });
+        }
+    }
+
     pub(super) fn set_option_as_alt(&self, value: OptionAsAlt) {
         self.ivars().option_as_alt.set(value)
     }
@@ -1078,7 +1090,11 @@ impl WinitView {
         )
         .map_or(PointerWindowRoute::Unknown, |pressed_buttons| {
             self.ivars().pressed_mouse_buttons.set(pressed_buttons);
-            pointer_capture_route(pressed_buttons, delivery)
+            pointer_capture_route(
+                pressed_buttons,
+                unsafe { NSEvent::pressedMouseButtons() },
+                delivery,
+            )
         });
 
         self.update_modifiers(event, false);
@@ -1110,7 +1126,11 @@ impl WinitView {
         self.update_modifiers(event, false);
 
         let delivery = RootWindowId(self.window().id());
-        let capture = pointer_capture_route(self.ivars().pressed_mouse_buttons.get(), delivery);
+        let capture = pointer_capture_route(
+            self.ivars().pressed_mouse_buttons.get(),
+            unsafe { NSEvent::pressedMouseButtons() },
+            delivery,
+        );
         self.queue_event(WindowEvent::CursorMoved {
             device_id: DEVICE_ID,
             position: view_point.to_physical(self.scale_factor()),
@@ -1157,16 +1177,11 @@ impl WinitView {
 
     fn scroll_capture_route(&self) -> PointerWindowRoute {
         let delivery = RootWindowId(self.window().id());
-        let local_buttons = self.ivars().pressed_mouse_buttons.get();
-        if local_buttons != 0 {
-            return PointerWindowRoute::Window(delivery);
-        }
-
-        if unsafe { NSEvent::pressedMouseButtons() } == 0 {
-            PointerWindowRoute::None
-        } else {
-            PointerWindowRoute::Unknown
-        }
+        pointer_capture_route(
+            self.ivars().pressed_mouse_buttons.get(),
+            unsafe { NSEvent::pressedMouseButtons() },
+            delivery,
+        )
     }
 
     fn pointer_hover_route(&self, event: &NSEvent) -> PointerWindowRoute {
@@ -1212,14 +1227,19 @@ fn classify_pointer_window_route(
 }
 
 fn pointer_capture_route(
-    pressed_buttons: NSUInteger,
+    local_pressed_buttons: NSUInteger,
+    global_pressed_buttons: NSUInteger,
     delivery: RootWindowId,
 ) -> PointerWindowRoute {
-    if pressed_buttons == 0 {
-        PointerWindowRoute::None
-    } else {
-        PointerWindowRoute::Window(delivery)
+    match (local_pressed_buttons, global_pressed_buttons) {
+        (0, 0) => PointerWindowRoute::None,
+        (local, global) if local == global => PointerWindowRoute::Window(delivery),
+        _ => PointerWindowRoute::Unknown,
     }
+}
+
+fn clear_pressed_mouse_buttons(pressed_buttons: &Cell<NSUInteger>) -> bool {
+    pressed_buttons.replace(0) != 0
 }
 
 fn update_pressed_mouse_buttons(
@@ -1242,7 +1262,67 @@ fn event_desktop_position(event: &NSEvent) -> Option<PhysicalPosition<f64>> {
     }
 
     let point = unsafe { CGEventGetLocation(cg_event.cast()) };
-    Some(PhysicalPosition::new(point.x, point.y))
+    let mappings = CGDisplay::active_displays()
+        .ok()?
+        .into_iter()
+        .filter_map(|display_id| {
+            let monitor = super::monitor::MonitorHandle::new(display_id)?;
+            Some(DesktopDisplayMapping {
+                quartz_bounds: CGDisplay::new(display_id).bounds(),
+                physical_origin: monitor.position(),
+                physical_size: monitor.size(),
+            })
+        })
+        .collect::<Vec<_>>();
+    map_quartz_desktop_position(point, &mappings)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DesktopDisplayMapping {
+    quartz_bounds: CGRect,
+    physical_origin: PhysicalPosition<i32>,
+    physical_size: PhysicalSize<u32>,
+}
+
+fn map_quartz_desktop_position(
+    point: CGPoint,
+    mappings: &[DesktopDisplayMapping],
+) -> Option<PhysicalPosition<f64>> {
+    if !point.x.is_finite() || !point.y.is_finite() {
+        return None;
+    }
+
+    let mut matches = mappings.iter().filter_map(|mapping| {
+        let bounds = mapping.quartz_bounds;
+        let width = bounds.size.width;
+        let height = bounds.size.height;
+        if !bounds.origin.x.is_finite()
+            || !bounds.origin.y.is_finite()
+            || !width.is_finite()
+            || !height.is_finite()
+            || width <= 0.0
+            || height <= 0.0
+        {
+            return None;
+        }
+        let max_x = bounds.origin.x + width;
+        let max_y = bounds.origin.y + height;
+        if point.x < bounds.origin.x
+            || point.x >= max_x
+            || point.y < bounds.origin.y
+            || point.y >= max_y
+        {
+            return None;
+        }
+
+        let x = f64::from(mapping.physical_origin.x)
+            + (point.x - bounds.origin.x) / width * f64::from(mapping.physical_size.width);
+        let y = f64::from(mapping.physical_origin.y)
+            + (point.y - bounds.origin.y) / height * f64::from(mapping.physical_size.height);
+        (x.is_finite() && y.is_finite()).then_some(PhysicalPosition::new(x, y))
+    });
+    let position = matches.next()?;
+    matches.next().is_none().then_some(position)
 }
 
 /// Get the mouse button from the NSEvent.
@@ -1302,6 +1382,8 @@ fn replace_event(event: &NSEvent, option_as_alt: OptionAsAlt) -> Retained<NSEven
 
 #[cfg(test)]
 mod pointer_route_tests {
+    use core_graphics::geometry::CGSize;
+
     use super::*;
 
     #[test]
@@ -1327,8 +1409,10 @@ mod pointer_route_tests {
     fn capture_follows_post_event_pressed_button_state() {
         let delivery = RootWindowId(super::super::window::WindowId(1));
 
-        assert_eq!(pointer_capture_route(1, delivery), PointerWindowRoute::Window(delivery));
-        assert_eq!(pointer_capture_route(0, delivery), PointerWindowRoute::None);
+        assert_eq!(pointer_capture_route(1, 1, delivery), PointerWindowRoute::Window(delivery));
+        assert_eq!(pointer_capture_route(0, 0, delivery), PointerWindowRoute::None);
+        assert_eq!(pointer_capture_route(1, 3, delivery), PointerWindowRoute::Unknown);
+        assert_eq!(pointer_capture_route(0, 1, delivery), PointerWindowRoute::Unknown);
     }
 
     #[test]
@@ -1345,5 +1429,69 @@ mod pointer_route_tests {
         assert_eq!(released_first, 0b10);
         assert_eq!(released_second, 0);
         assert_eq!(update_pressed_mouse_buttons(0, -1, ElementState::Pressed), None);
+    }
+
+    #[test]
+    fn pointer_capture_reset_is_idempotent() {
+        let pressed = Cell::new(0b11);
+
+        assert!(clear_pressed_mouse_buttons(&pressed));
+        assert_eq!(pressed.get(), 0);
+        assert!(!clear_pressed_mouse_buttons(&pressed));
+    }
+
+    #[test]
+    fn quartz_desktop_points_map_through_the_exact_display() {
+        let mappings = [
+            DesktopDisplayMapping {
+                quartz_bounds: CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(1_440.0, 900.0)),
+                physical_origin: PhysicalPosition::new(0, 0),
+                physical_size: PhysicalSize::new(2_880, 1_800),
+            },
+            DesktopDisplayMapping {
+                quartz_bounds: CGRect::new(
+                    &CGPoint::new(1_440.0, 0.0),
+                    &CGSize::new(1_920.0, 1_080.0),
+                ),
+                physical_origin: PhysicalPosition::new(2_880, 0),
+                physical_size: PhysicalSize::new(1_920, 1_080),
+            },
+            DesktopDisplayMapping {
+                quartz_bounds: CGRect::new(
+                    &CGPoint::new(-1_280.0, -1_024.0),
+                    &CGSize::new(1_280.0, 1_024.0),
+                ),
+                physical_origin: PhysicalPosition::new(-1_280, -1_024),
+                physical_size: PhysicalSize::new(1_280, 1_024),
+            },
+        ];
+
+        assert_eq!(
+            map_quartz_desktop_position(CGPoint::new(720.0, 450.0), &mappings),
+            Some(PhysicalPosition::new(1_440.0, 900.0))
+        );
+        assert_eq!(
+            map_quartz_desktop_position(CGPoint::new(2_400.0, 540.0), &mappings),
+            Some(PhysicalPosition::new(3_840.0, 540.0))
+        );
+        assert_eq!(
+            map_quartz_desktop_position(CGPoint::new(-640.0, -512.0), &mappings),
+            Some(PhysicalPosition::new(-640.0, -512.0))
+        );
+    }
+
+    #[test]
+    fn overlapping_or_missing_display_mapping_is_unknown() {
+        let mapping = DesktopDisplayMapping {
+            quartz_bounds: CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(100.0, 100.0)),
+            physical_origin: PhysicalPosition::new(0, 0),
+            physical_size: PhysicalSize::new(200, 200),
+        };
+
+        assert_eq!(
+            map_quartz_desktop_position(CGPoint::new(50.0, 50.0), &[mapping, mapping]),
+            None
+        );
+        assert_eq!(map_quartz_desktop_position(CGPoint::new(150.0, 50.0), &[mapping]), None);
     }
 }

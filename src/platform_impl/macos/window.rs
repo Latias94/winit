@@ -6,6 +6,7 @@ use objc2_app_kit::{NSResponder, NSWindow};
 use objc2_foundation::{MainThreadBound, MainThreadMarker, NSObject};
 
 use super::event_loop::ActiveEventLoop;
+use super::view::WinitView;
 use super::window_delegate::WindowDelegate;
 use crate::error::OsError as RootOsError;
 use crate::window::WindowAttributes;
@@ -122,5 +123,14 @@ declare_class!(
 impl WinitWindow {
     pub(super) fn id(&self) -> WindowId {
         WindowId(self as *const Self as usize)
+    }
+
+    #[track_caller]
+    pub(super) fn view(&self) -> Retained<WinitView> {
+        // SAFETY: Winit always installs `WinitView` as the content view of
+        // `WinitWindow` during construction.
+        unsafe {
+            Retained::cast(self.contentView().expect("winit window must have a content view"))
+        }
     }
 }

@@ -13,6 +13,7 @@ use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProto
 use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
 use super::observer::{EventLoopWaker, RunLoop};
+use super::window::WinitWindow;
 use super::{menu, WindowId, DEVICE_ID};
 use crate::event::{DeviceEvent, Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
@@ -69,6 +70,11 @@ declare_class!(
         #[method(applicationWillTerminate:)]
         fn app_will_terminate(&self, notification: &NSNotification) {
             self.will_terminate(notification)
+        }
+
+        #[method(applicationDidResignActive:)]
+        fn app_did_resign_active(&self, notification: &NSNotification) {
+            self.did_resign_active(notification)
         }
     }
 );
@@ -169,6 +175,18 @@ impl ApplicationDelegate {
         let app = NSApplication::sharedApplication(mtm);
         notify_windows_of_exit(&app);
         self.internal_exit();
+    }
+
+    fn did_resign_active(&self, _notification: &NSNotification) {
+        trace_scope!("applicationDidResignActive:");
+        let mtm = MainThreadMarker::from(self);
+        for window in NSApplication::sharedApplication(mtm).windows() {
+            if window.is_kind_of::<WinitWindow>() {
+                // SAFETY: The dynamic class check above proves the window type.
+                let window = unsafe { Retained::cast::<WinitWindow>(window) };
+                window.view().reset_pointer_capture();
+            }
+        }
     }
 
     pub fn get(mtm: MainThreadMarker) -> Retained<Self> {
