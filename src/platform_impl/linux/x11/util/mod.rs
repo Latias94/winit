@@ -15,7 +15,7 @@ mod input;
 pub mod keys;
 pub(crate) mod memory;
 mod mouse;
-mod randr;
+pub(crate) mod randr;
 mod window_property;
 mod wm;
 mod xmodmap;

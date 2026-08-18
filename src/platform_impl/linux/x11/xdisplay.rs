@@ -9,8 +9,10 @@ use crate::window::CursorIcon;
 use super::atoms::Atoms;
 use super::ffi;
 use super::monitor::MonitorHandle;
-use x11rb::connection::Connection;
+use super::work_area::{merge_event_masks, WorkAreaCache};
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::randr::ConnectionExt as _;
+use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt};
 use x11rb::resource_manager;
 use x11rb::xcb_ffi::XCBConnection;
@@ -45,6 +47,9 @@ pub struct XConnection {
 
     /// List of monitor handles.
     pub monitor_handles: Mutex<Option<Vec<MonitorHandle>>>,
+
+    /// Lazily refreshed exact EWMH/RandR work-area authority.
+    pub(super) work_area_cache: Mutex<WorkAreaCache>,
 
     /// The resource database.
     database: RwLock<resource_manager::Database>,
@@ -108,7 +113,7 @@ impl XConnection {
 
         // Load the RandR version.
         let randr_version = xcb
-            .randr_query_version(1, 3)
+            .randr_query_version(1, 6)
             .expect("failed to request XRandR version")
             .reply()
             .expect("failed to query XRandR version");
@@ -135,6 +140,7 @@ impl XConnection {
             timestamp: AtomicU32::new(0),
             latest_error: Mutex::new(None),
             monitor_handles: Mutex::new(None),
+            work_area_cache: Mutex::new(WorkAreaCache::new()),
             database: RwLock::new(database),
             cursor_cache: Default::default(),
             randr_version: (randr_version.major_version, randr_version.minor_version),
@@ -151,21 +157,36 @@ impl XConnection {
             .ok()?
             .atom;
 
-        // Get PropertyNotify events from the XSETTINGS window.
-        // TODO: The XSETTINGS window here can change. In the future, listen for DestroyNotify on
-        // this window in order to accommodate for a changed window here.
-        let selector_window = xcb.get_selection_owner(xsettings_screen).ok()?.reply().ok()?.owner;
-
-        xcb.change_window_attributes(
-            selector_window,
-            &xproto::ChangeWindowAttributesAux::new()
-                .event_mask(xproto::EventMask::PROPERTY_CHANGE),
-        )
-        .ok()?
-        .check()
-        .ok()?;
-
+        // Keep the atom even when no owner exists yet. Event-loop initialization binds the current
+        // owner and XFixes reports future replacements.
         Some(xsettings_screen)
+    }
+
+    pub(crate) fn select_events_preserving(
+        &self,
+        window: xproto::Window,
+        required: xproto::EventMask,
+    ) -> bool {
+        select_events_preserving(self.xcb_connection(), window, required)
+    }
+
+    pub(crate) fn select_xsettings_owner_input(&self, root: xproto::Window) -> Option<u8> {
+        let selection = self.xsettings_screen()?;
+        let extension =
+            self.xcb_connection().extension_information(xfixes::X11_EXTENSION_NAME).ok()??;
+        self.xcb_connection().xfixes_query_version(5, 0).ok()?.reply().ok()?;
+        self.xcb_connection()
+            .xfixes_select_selection_input(
+                root,
+                selection,
+                xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                    | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                    | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
+            )
+            .ok()?
+            .check()
+            .ok()?;
+        Some(extension.first_event)
     }
 
     /// Checks whether an error has been triggered by the previous function calls.
@@ -254,6 +275,29 @@ impl XConnection {
     #[inline]
     pub fn xsettings_screen(&self) -> Option<xproto::Atom> {
         self.xsettings_screen
+    }
+}
+
+fn select_events_preserving(
+    xcb: &XCBConnection,
+    window: xproto::Window,
+    required: xproto::EventMask,
+) -> bool {
+    let attributes = match xcb.get_window_attributes(window) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(attributes) => attributes,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    let event_mask: xproto::EventMask =
+        merge_event_masks(attributes.your_event_mask.into(), required.into()).into();
+    match xcb.change_window_attributes(
+        window,
+        &xproto::ChangeWindowAttributesAux::new().event_mask(event_mask),
+    ) {
+        Ok(cookie) => cookie.check().is_ok(),
+        Err(_) => false,
     }
 }
 

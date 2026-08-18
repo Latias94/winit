@@ -295,8 +295,6 @@ impl XConnection {
     }
 
     pub fn select_xrandr_input(&self, root: xproto::Window) -> Result<u8, X11Error> {
-        use randr::NotifyMask;
-
         // Get extension info.
         let info = self
             .xcb_connection()
@@ -304,12 +302,36 @@ impl XConnection {
             .ok_or(X11Error::MissingExtension(randr::X11_EXTENSION_NAME))?;
 
         // Select input data.
-        let event_mask =
-            NotifyMask::CRTC_CHANGE | NotifyMask::OUTPUT_PROPERTY | NotifyMask::SCREEN_CHANGE;
-        self.xcb_connection().randr_select_input(root, event_mask)?;
+        self.xcb_connection()
+            .randr_select_input(root, monitor_authority_notify_mask(self.randr_version()))?
+            .check()?;
 
         Ok(info.first_event)
     }
+}
+
+fn monitor_authority_notify_mask(randr_version: (u32, u32)) -> randr::NotifyMask {
+    use randr::NotifyMask;
+
+    // These events cover every RandR fact consumed by monitor enumeration and the exact work-area
+    // authority: root geometry, the CRTC/output roster, output assignment/connection/modes,
+    // output properties, resource roster replacement, and leases that can disable resources for
+    // other clients. Newer selection bits are only valid after the server negotiated that version.
+    let mut mask = NotifyMask::SCREEN_CHANGE
+        | NotifyMask::CRTC_CHANGE
+        | NotifyMask::OUTPUT_CHANGE
+        | NotifyMask::OUTPUT_PROPERTY;
+    if randr_version_at_least(randr_version, (1, 4)) {
+        mask |= NotifyMask::RESOURCE_CHANGE;
+    }
+    if randr_version_at_least(randr_version, (1, 6)) {
+        mask |= NotifyMask::LEASE;
+    }
+    mask
+}
+
+const fn randr_version_at_least(actual: (u32, u32), required: (u32, u32)) -> bool {
+    actual.0 > required.0 || (actual.0 == required.0 && actual.1 >= required.1)
 }
 
 pub struct ScreenResources {
@@ -351,5 +373,37 @@ impl ScreenResources {
         reply: randr::GetScreenResourcesCurrentReply,
     ) -> Self {
         Self { modes: reply.modes, crtcs: reply.crtcs }
+    }
+}
+
+#[cfg(test)]
+mod notify_mask_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_authority_subscribes_to_every_randr_1_3_fact() {
+        let mask = u16::from(monitor_authority_notify_mask((1, 3)));
+
+        for required in [
+            randr::NotifyMask::SCREEN_CHANGE,
+            randr::NotifyMask::CRTC_CHANGE,
+            randr::NotifyMask::OUTPUT_CHANGE,
+            randr::NotifyMask::OUTPUT_PROPERTY,
+        ] {
+            assert_eq!(mask & u16::from(required), u16::from(required));
+        }
+        assert_eq!(mask & u16::from(randr::NotifyMask::RESOURCE_CHANGE), 0);
+        assert_eq!(mask & u16::from(randr::NotifyMask::LEASE), 0);
+    }
+
+    #[test]
+    fn monitor_authority_versions_newer_randr_selection_bits() {
+        let randr_1_4 = u16::from(monitor_authority_notify_mask((1, 4)));
+        assert_ne!(randr_1_4 & u16::from(randr::NotifyMask::RESOURCE_CHANGE), 0);
+        assert_eq!(randr_1_4 & u16::from(randr::NotifyMask::LEASE), 0);
+
+        let randr_1_6 = u16::from(monitor_authority_notify_mask((1, 6)));
+        assert_ne!(randr_1_6 & u16::from(randr::NotifyMask::RESOURCE_CHANGE), 0);
+        assert_ne!(randr_1_6 & u16::from(randr::NotifyMask::LEASE), 0);
     }
 }

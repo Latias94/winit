@@ -18,6 +18,7 @@ const DPI_NAME: &[u8] = b"Xft/DPI";
 const DPI_MULTIPLIER: f64 = 1024.0;
 const LITTLE_ENDIAN: u8 = b'l';
 const BIG_ENDIAN: u8 = b'B';
+const MAX_EXACT_SETTINGS: u32 = 4096;
 
 impl XConnection {
     /// Get the DPI from XSettings.
@@ -29,31 +30,84 @@ impl XConnection {
 
         // Get the current owner of the screen's settings.
         let owner = self.xcb_connection().get_selection_owner(xsettings_screen)?.reply()?;
+        if owner.owner == 0 {
+            return Ok(None);
+        }
 
         // Read the _XSETTINGS_SETTINGS property.
         let data: Vec<u8> =
             self.get_property(owner.owner, atoms[_XSETTINGS_SETTINGS], atoms[_XSETTINGS_SETTINGS])?;
 
-        // Parse the property.
-        let dpi_setting = read_settings(&data)?
-            .find(|res| res.as_ref().map_or(true, |s| s.name == DPI_NAME))
-            .transpose()?;
-        if let Some(dpi_setting) = dpi_setting {
-            let base_dpi = match dpi_setting.data {
-                SettingData::Integer(dpi) => dpi as f64,
-                SettingData::String(_) => {
-                    return Err(ParserError::BadType(SettingType::String).into())
-                },
-                SettingData::Color(_) => {
-                    return Err(ParserError::BadType(SettingType::Color).into())
-                },
-            };
+        parse_xsettings_dpi(&data).map_err(Into::into)
+    }
+}
 
-            Ok(Some(base_dpi / DPI_MULTIPLIER))
-        } else {
-            Ok(None)
+/// Parse the Xft DPI value using Winit's compatibility behavior.
+pub(crate) fn parse_xsettings_dpi(data: &[u8]) -> Result<Option<f64>> {
+    let dpi_setting = read_settings(data)?
+        .find(|res| res.as_ref().map_or(true, |s| s.name == DPI_NAME))
+        .transpose()?;
+    if let Some(dpi_setting) = dpi_setting {
+        let base_dpi = match dpi_setting.data {
+            SettingData::Integer(dpi) => dpi as f64,
+            SettingData::String(_) => return Err(ParserError::BadType(SettingType::String)),
+            SettingData::Color(_) => return Err(ParserError::BadType(SettingType::Color)),
+        };
+
+        Ok(Some(base_dpi / DPI_MULTIPLIER))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Parse one complete `_XSETTINGS_SETTINGS` property for an exact authority snapshot.
+pub(crate) fn parse_xsettings_dpi_exact(data: &[u8]) -> Result<Option<f64>> {
+    let mut parser = Parser::new_exact(data)?;
+    let total_settings = parser.u32()?;
+    if total_settings > MAX_EXACT_SETTINGS {
+        return Err(ParserError::TooManySettings(total_settings));
+    }
+
+    let mut dpi = None;
+    for _ in 0..total_settings {
+        let setting = Setting::parse_exact(&mut parser)?;
+        if !valid_exact_setting_name(setting.name) {
+            return Err(ParserError::InvalidName);
+        }
+        if setting.name != DPI_NAME {
+            continue;
+        }
+        if dpi.is_some() {
+            return Err(ParserError::DuplicateDpi);
+        }
+        let base_dpi = match setting.data {
+            SettingData::Integer(base_dpi) => base_dpi,
+            SettingData::String(_) => return Err(ParserError::BadType(SettingType::String)),
+            SettingData::Color(_) => return Err(ParserError::BadType(SettingType::Color)),
+        };
+        dpi = Some(base_dpi as f64 / DPI_MULTIPLIER);
+    }
+    if !parser.is_empty() {
+        return Err(ParserError::TrailingBytes(parser.remaining_len()));
+    }
+    Ok(dpi)
+}
+
+fn valid_exact_setting_name(name: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut segment_start = true;
+    for byte in name {
+        match *byte {
+            b'/' if segment_start => return false,
+            b'/' => segment_start = true,
+            b'0'..=b'9' if segment_start => return false,
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_' => segment_start = false,
+            _ => return false,
         }
     }
+    !segment_start
 }
 
 /// Read over the settings in the block of data.
@@ -128,6 +182,35 @@ impl<'a> Setting<'a> {
 
         Ok(Setting { name, data })
     }
+
+    fn parse_exact(parser: &mut Parser<'a>) -> Result<Self> {
+        let ty: SettingType = parser.i8()?.try_into()?;
+        parser.zero_padding(1)?;
+
+        let name_len = usize::from(parser.u16()?);
+        let name = parser.advance(name_len)?;
+        parser.pad_exact(name.len(), 4)?;
+
+        // The per-setting serial is authority metadata, but it does not affect the DPI value.
+        parser.advance(4)?;
+
+        let data = match ty {
+            SettingType::Integer => SettingData::Integer(parser.i32()?),
+            SettingType::String => {
+                let data_len = parser.u32()?;
+                let data_len =
+                    usize::try_from(data_len).map_err(|_| ParserError::LengthOverflow(data_len))?;
+                let data = parser.advance(data_len)?;
+                parser.pad_exact(data.len(), 4)?;
+                SettingData::String(data)
+            },
+            SettingType::Color => {
+                SettingData::Color([parser.i16()?, parser.i16()?, parser.i16()?, parser.i16()?])
+            },
+        };
+
+        Ok(Setting { name, data })
+    }
 }
 
 #[derive(Debug)]
@@ -173,6 +256,22 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn new_exact(bytes: &'a [u8]) -> Result<Self> {
+        let marker = *bytes.first().ok_or_else(|| ParserError::ran_out(1, 0))?;
+        let endianness = match marker {
+            BIG_ENDIAN => Endianness::Big,
+            LITTLE_ENDIAN => Endianness::Little,
+            marker => return Err(ParserError::InvalidByteOrder(marker)),
+        };
+        let metadata = bytes
+            .get(1..8)
+            .ok_or_else(|| ParserError::ran_out(7, bytes.len().saturating_sub(1)))?;
+        if metadata[..3].iter().any(|byte| *byte != 0) {
+            return Err(ParserError::NonZeroPadding);
+        }
+        Ok(Self { bytes: &bytes[8..], endianness })
+    }
+
     /// Get a slice of bytes.
     fn advance(&mut self, n: usize) -> Result<&'a [u8]> {
         if n == 0 {
@@ -195,6 +294,26 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn pad_exact(&mut self, size: usize, pad: usize) -> Result<()> {
+        let advance = (pad - (size % pad)) % pad;
+        self.zero_padding(advance)
+    }
+
+    fn zero_padding(&mut self, n: usize) -> Result<()> {
+        if self.advance(n)?.iter().any(|byte| *byte != 0) {
+            return Err(ParserError::NonZeroPadding);
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.bytes.len()
+    }
+
     /// Get a single byte.
     fn i8(&mut self) -> Result<i8> {
         self.advance(1).map(|s| s[0] as i8)
@@ -211,6 +330,16 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn u16(&mut self) -> Result<u16> {
+        self.advance(2).map(|s| {
+            let bytes: &[u8; 2] = s.try_into().unwrap();
+            match self.endianness {
+                Endianness::Big => u16::from_be_bytes(*bytes),
+                Endianness::Little => u16::from_le_bytes(*bytes),
+            }
+        })
+    }
+
     /// Get four bytes.
     fn i32(&mut self) -> Result<i32> {
         self.advance(4).map(|s| {
@@ -218,6 +347,16 @@ impl<'a> Parser<'a> {
             match self.endianness {
                 Endianness::Big => i32::from_be_bytes(*bytes),
                 Endianness::Little => i32::from_le_bytes(*bytes),
+            }
+        })
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        self.advance(4).map(|s| {
+            let bytes: &[u8; 4] = s.try_into().unwrap();
+            match self.endianness {
+                Endianness::Big => u32::from_be_bytes(*bytes),
+                Endianness::Little => u32::from_le_bytes(*bytes),
             }
         })
     }
@@ -253,6 +392,27 @@ pub enum ParserError {
 
     /// Bad setting type.
     BadType(SettingType),
+
+    /// Invalid byte-order marker for an exact authority property.
+    InvalidByteOrder(u8),
+
+    /// Declared setting count exceeds the exact parser bound.
+    TooManySettings(u32),
+
+    /// A declared data length does not fit this platform's address space.
+    LengthOverflow(u32),
+
+    /// More than one Xft DPI setting was declared.
+    DuplicateDpi,
+
+    /// Bytes remained after all declared settings were parsed.
+    TrailingBytes(usize),
+
+    /// Reserved alignment bytes were nonzero.
+    NonZeroPadding,
+
+    /// A setting name violated the XSETTINGS ASCII path grammar.
+    InvalidName,
 }
 
 impl ParserError {
@@ -307,6 +467,63 @@ mod tests {
         assert_string(&rgba.data, "rgb");
         let lcd = settings.iter().find(|s| s.name == b"Xft/Lcdfilter").unwrap();
         assert_string(&lcd.data, "lcddefault");
+    }
+
+    #[test]
+    fn exact_parser_reads_the_complete_property() {
+        let data = integer_settings(&[(DPI_NAME, 96 * 1024), (b"Xft/Hinting", 1)]);
+        assert_eq!(parse_xsettings_dpi_exact(&data).unwrap(), Some(96.0));
+
+        let mut truncated_after_dpi = integer_settings(&[(DPI_NAME, 96 * 1024)]);
+        truncated_after_dpi[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(parse_xsettings_dpi(&truncated_after_dpi).unwrap(), Some(96.0));
+        assert!(parse_xsettings_dpi_exact(&truncated_after_dpi).is_err());
+    }
+
+    #[test]
+    fn exact_parser_rejects_ambiguous_or_malformed_authority() {
+        let duplicate = integer_settings(&[(DPI_NAME, 96 * 1024), (DPI_NAME, 120 * 1024)]);
+        assert!(matches!(parse_xsettings_dpi_exact(&duplicate), Err(ParserError::DuplicateDpi)));
+
+        let mut trailing = integer_settings(&[(DPI_NAME, 96 * 1024)]);
+        trailing.push(0);
+        assert!(matches!(parse_xsettings_dpi_exact(&trailing), Err(ParserError::TrailingBytes(1))));
+
+        let mut bad_endian = integer_settings(&[(DPI_NAME, 96 * 1024)]);
+        bad_endian[0] = b'?';
+        assert!(matches!(
+            parse_xsettings_dpi_exact(&bad_endian),
+            Err(ParserError::InvalidByteOrder(b'?'))
+        ));
+
+        let mut bad_padding = integer_settings(&[(DPI_NAME, 96 * 1024)]);
+        bad_padding[1] = 1;
+        assert!(matches!(
+            parse_xsettings_dpi_exact(&bad_padding),
+            Err(ParserError::NonZeroPadding)
+        ));
+
+        for name in [&b""[..], &b"Xft//DPI"[..], &b"9Xft/DPI"[..], &b"Xft/DPI/"[..]] {
+            assert!(matches!(
+                parse_xsettings_dpi_exact(&integer_settings(&[(name, 1)])),
+                Err(ParserError::InvalidName)
+            ));
+        }
+    }
+
+    fn integer_settings(settings: &[(&[u8], i32)]) -> Vec<u8> {
+        let mut data = vec![LITTLE_ENDIAN, 0, 0, 0, 0, 0, 0, 0];
+        data.extend(u32::try_from(settings.len()).unwrap().to_le_bytes());
+        for (name, value) in settings {
+            data.extend([SettingType::Integer as u8, 0]);
+            data.extend(u16::try_from(name.len()).unwrap().to_le_bytes());
+            data.extend(*name);
+            let padding = (4 - data.len() % 4) % 4;
+            data.resize(data.len() + padding, 0);
+            data.extend(0u32.to_le_bytes());
+            data.extend(value.to_le_bytes());
+        }
+        data
     }
 
     fn assert_string(dat: &SettingData<'_>, s: &str) {

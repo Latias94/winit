@@ -6,7 +6,95 @@ use crate::event_loop::{ActiveEventLoop, EventLoop, EventLoopBuilder};
 use crate::monitor::MonitorHandle;
 use crate::window::{Window, WindowAttributes};
 
-use crate::dpi::Size;
+use crate::dpi::{PhysicalPosition, PhysicalSize, Size};
+
+/// One monitor in an exact X11 work-area authority snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct X11WorkAreaRecord {
+    crtc_id: u32,
+    monitor_position: PhysicalPosition<i32>,
+    monitor_size: PhysicalSize<u32>,
+    work_area_position: PhysicalPosition<i32>,
+    work_area_size: PhysicalSize<u32>,
+    scale_factor: f64,
+}
+
+impl X11WorkAreaRecord {
+    pub(crate) const fn new(
+        crtc_id: u32,
+        monitor_position: PhysicalPosition<i32>,
+        monitor_size: PhysicalSize<u32>,
+        work_area_position: PhysicalPosition<i32>,
+        work_area_size: PhysicalSize<u32>,
+        scale_factor: f64,
+    ) -> Self {
+        Self {
+            crtc_id,
+            monitor_position,
+            monitor_size,
+            work_area_position,
+            work_area_size,
+            scale_factor,
+        }
+    }
+
+    /// The RandR CRTC that identifies this monitor.
+    pub const fn crtc_id(&self) -> u32 {
+        self.crtc_id
+    }
+
+    /// The monitor position in root-window physical coordinates.
+    pub const fn monitor_position(&self) -> PhysicalPosition<i32> {
+        self.monitor_position
+    }
+
+    /// The full monitor size in physical pixels.
+    pub const fn monitor_size(&self) -> PhysicalSize<u32> {
+        self.monitor_size
+    }
+
+    /// The usable work-area position in root-window physical coordinates.
+    pub const fn work_area_position(&self) -> PhysicalPosition<i32> {
+        self.work_area_position
+    }
+
+    /// The usable work-area size in physical pixels.
+    pub const fn work_area_size(&self) -> PhysicalSize<u32> {
+        self.work_area_size
+    }
+
+    /// Winit's scale factor for this monitor in the same authority generation.
+    pub const fn scale_factor(&self) -> f64 {
+        self.scale_factor
+    }
+}
+
+/// A complete, exact X11 monitor work-area roster from one authority generation.
+///
+/// Winit currently publishes this snapshot only when one active RandR CRTC exactly covers the root
+/// window. EWMH exposes a desktop-wide work area, so multi-monitor work areas remain unknown until
+/// their per-monitor projection can be proven.
+#[derive(Clone, Debug, PartialEq)]
+pub struct X11WorkAreaAuthoritySnapshot {
+    generation: u64,
+    records: Vec<X11WorkAreaRecord>,
+}
+
+impl X11WorkAreaAuthoritySnapshot {
+    pub(crate) const fn new(generation: u64, records: Vec<X11WorkAreaRecord>) -> Self {
+        Self { generation, records }
+    }
+
+    /// Monotonically increasing generation of the validated authority snapshot.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The exact records proven for this generation.
+    pub fn records(&self) -> &[X11WorkAreaRecord] {
+        &self.records
+    }
+}
 
 /// X window type. Maps directly to
 /// [`_NET_WM_WINDOW_TYPE`](https://specifications.freedesktop.org/wm-spec/wm-spec-1.5.html).
@@ -88,12 +176,31 @@ pub fn register_xlib_error_hook(hook: XlibErrorHook) {
 pub trait ActiveEventLoopExtX11 {
     /// True if the [`ActiveEventLoop`] uses X11.
     fn is_x11(&self) -> bool;
+
+    /// Returns one complete work-area authority snapshot when X11 can prove it exactly.
+    ///
+    /// This returns `None` for non-X11 backends and whenever EWMH, RandR, or scale authority is
+    /// missing, malformed, stale, or ambiguous. A cached snapshot is refreshed only after a
+    /// relevant native event invalidates it. The current proof is limited to the X connection's
+    /// first screen because Winit's X resource database uses that screen's root.
+    fn work_area_authority_snapshot(&self) -> Option<X11WorkAreaAuthoritySnapshot>;
 }
 
 impl ActiveEventLoopExtX11 for ActiveEventLoop {
     #[inline]
     fn is_x11(&self) -> bool {
         !self.p.is_wayland()
+    }
+
+    #[inline]
+    fn work_area_authority_snapshot(&self) -> Option<X11WorkAreaAuthoritySnapshot> {
+        match &self.p {
+            crate::platform_impl::ActiveEventLoop::X(event_loop) => {
+                event_loop.work_area_authority_snapshot()
+            },
+            #[cfg(wayland_platform)]
+            crate::platform_impl::ActiveEventLoop::Wayland(_) => None,
+        }
     }
 }
 

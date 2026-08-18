@@ -46,6 +46,7 @@ mod monitor;
 mod pointer_facts;
 mod util;
 mod window;
+mod work_area;
 mod xdisplay;
 mod xsettings;
 
@@ -220,6 +221,8 @@ impl<T: 'static> EventLoop<T> {
 
         let randr_event_offset =
             xconn.select_xrandr_input(root).expect("Failed to query XRandR extension");
+        let xsettings_event_offset = xconn.select_xsettings_owner_input(root);
+        xconn.enable_work_area_tracking(root, xsettings_event_offset.is_some());
 
         let xi2ext = xconn
             .xcb_connection()
@@ -317,6 +320,7 @@ impl<T: 'static> EventLoop<T> {
             dnd,
             devices: Default::default(),
             randr_event_offset,
+            xsettings_event_offset,
             ime_receiver,
             ime_event_receiver,
             xi2ext,
@@ -637,6 +641,12 @@ impl ActiveEventLoop {
     #[inline]
     pub(crate) fn x_connection(&self) -> &Arc<XConnection> {
         &self.xconn
+    }
+
+    pub(crate) fn work_area_authority_snapshot(
+        &self,
+    ) -> Option<crate::platform::x11::X11WorkAreaAuthoritySnapshot> {
+        self.xconn.work_area_authority_snapshot()
     }
 
     pub fn available_monitors(&self) -> impl Iterator<Item = MonitorHandle> {

@@ -4,6 +4,7 @@ use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::slice;
 use std::sync::{Arc, Mutex};
 
+use x11_dl::xfixes::XFixesSelectionNotifyEvent;
 use x11_dl::xinput2::{
     self, XIDeviceEvent, XIEnterEvent, XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent,
     XILeaveEvent, XIModifierState, XIRawEvent,
@@ -13,9 +14,9 @@ use x11_dl::xlib::{
     XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XMapEvent, XPropertyEvent,
     XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
 };
-use x11rb::protocol::xinput;
 use x11rb::protocol::xkb::ID as XkbId;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, ModMask};
+use x11rb::protocol::{randr, xfixes, xinput};
 use x11rb::x11_utils::{ExtensionInformation, Serialize};
 use xkbcommon_dl::xkb_mod_mask_t;
 
@@ -92,6 +93,7 @@ pub struct EventProcessor {
     pub ime_receiver: ImeReceiver,
     pub ime_event_receiver: ImeEventReceiver,
     pub randr_event_offset: u8,
+    pub xsettings_event_offset: Option<u8>,
     pub devices: RefCell<HashMap<DeviceId, Device>>,
     pub xi2ext: ExtensionInformation,
     pub xkbext: ExtensionInformation,
@@ -356,8 +358,32 @@ impl EventProcessor {
                     let xev: &XkbAnyEvent = unsafe { &*(xev as *const _ as *const XkbAnyEvent) };
                     self.xkb_event(xev, &mut callback);
                 }
-                if event_type == self.randr_event_offset as c_int {
+                if event_type
+                    == self.randr_event_offset as c_int + randr::SCREEN_CHANGE_NOTIFY_EVENT as c_int
+                {
                     self.process_dpi_change(&mut callback);
+                }
+                if event_type == self.randr_event_offset as c_int + randr::NOTIFY_EVENT as c_int {
+                    let wt = Self::window_target(&self.target);
+                    wt.xconn.invalidate_work_area_authority();
+                }
+                if self.xsettings_event_offset.is_some_and(|event_offset| {
+                    event_type == event_offset as c_int + xfixes::SELECTION_NOTIFY_EVENT as c_int
+                }) {
+                    // SAFETY: XFixes reports this event type with the layout declared by
+                    // `XFixesSelectionNotifyEvent`; the extension offset was queried from the
+                    // same display connection.
+                    let xev: &XFixesSelectionNotifyEvent =
+                        unsafe { &*(xev as *const _ as *const XFixesSelectionNotifyEvent) };
+                    let wt = Self::window_target(&self.target);
+                    if wt
+                        .xconn
+                        .xsettings_screen()
+                        .is_some_and(|selection| xev.selection as xproto::Atom == selection)
+                    {
+                        wt.xconn.xsettings_owner_changed(xev.owner as xproto::Window);
+                        self.process_dpi_change(&mut callback);
+                    }
                 }
             },
         }
@@ -871,10 +897,10 @@ impl EventProcessor {
             drop(shared_state_lock);
 
             if moved {
-                callback(
-                    &self.target,
-                    Event::WindowEvent { window_id, event: WindowEvent::Moved(outer.into()) },
-                );
+                callback(&self.target, Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::Moved(outer.into()),
+                });
             }
             outer
         };
@@ -919,16 +945,13 @@ impl EventProcessor {
                 drop(shared_state_lock);
 
                 let inner_size = Arc::new(Mutex::new(new_inner_size));
-                callback(
-                    &self.target,
-                    Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::ScaleFactorChanged {
-                            scale_factor: new_scale_factor,
-                            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
-                        },
+                callback(&self.target, Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::ScaleFactorChanged {
+                        scale_factor: new_scale_factor,
+                        inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
                     },
-                );
+                });
 
                 let new_inner_size = *inner_size.lock().unwrap();
                 drop(inner_size);
@@ -975,13 +998,10 @@ impl EventProcessor {
         }
 
         if resized {
-            callback(
-                &self.target,
-                Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::Resized(new_inner_size.into()),
-                },
-            );
+            callback(&self.target, Event::WindowEvent {
+                window_id,
+                event: WindowEvent::Resized(new_inner_size.into()),
+            });
         }
     }
 
@@ -994,6 +1014,7 @@ impl EventProcessor {
         let wt = Self::window_target(&self.target);
 
         wt.xconn.update_cached_wm_info(wt.root);
+        wt.xconn.invalidate_work_area_authority();
 
         self.with_window(xev.window as xproto::Window, |window| {
             window.invalidate_cached_frame_extents();
@@ -1004,7 +1025,11 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
+        let wt = Self::window_target(&self.target);
         let window = xev.window as xproto::Window;
+        if wt.xconn.is_work_area_authority_window(window) && !self.window_exists(window) {
+            return;
+        }
         let window_id = mkwid(window);
 
         // NOTE: Re-issue the focus state when mapping the window.
@@ -1026,6 +1051,10 @@ impl EventProcessor {
 
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
+        let authority_window = wt.xconn.work_area_authority_window_destroyed(window);
+        if authority_window && !self.window_exists(window) {
+            return;
+        }
 
         // Destroying an implicit-grab owner terminates that device stream. Emit the reset before
         // `Destroyed` while the delivery window still has a meaningful identity.
@@ -1051,11 +1080,13 @@ impl EventProcessor {
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
-        let atoms = wt.x_connection().atoms();
         let atom = xev.atom as xproto::Atom;
 
+        let current_xsettings_changed =
+            wt.xconn.work_area_property_changed(xev.window as xproto::Window, atom);
+
         if atom == xproto::Atom::from(xproto::AtomEnum::RESOURCE_MANAGER)
-            || atom == atoms[_XSETTINGS_SETTINGS]
+            || current_xsettings_changed
         {
             self.process_dpi_change(&mut callback);
         }
@@ -1799,13 +1830,10 @@ impl EventProcessor {
         }
         let physical_key = xkb::raw_keycode_to_physicalkey(keycode);
 
-        callback(
-            &self.target,
-            Event::DeviceEvent {
-                device_id,
-                event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
-            },
-        );
+        callback(&self.target, Event::DeviceEvent {
+            device_id,
+            event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
+        });
     }
 
     fn xinput2_hierarchy_changed<T: 'static, F>(&mut self, xev: &XIHierarchyEvent, mut callback: F)
@@ -1820,24 +1848,18 @@ impl EventProcessor {
         for info in infos {
             if 0 != info.flags & (xinput2::XISlaveAdded | xinput2::XIMasterAdded) {
                 self.init_device(info.deviceid as xinput::DeviceId);
-                callback(
-                    &self.target,
-                    Event::DeviceEvent {
-                        device_id: mkdid(info.deviceid as xinput::DeviceId),
-                        event: DeviceEvent::Added,
-                    },
-                );
+                callback(&self.target, Event::DeviceEvent {
+                    device_id: mkdid(info.deviceid as xinput::DeviceId),
+                    event: DeviceEvent::Added,
+                });
             } else if 0 != info.flags & (xinput2::XISlaveRemoved | xinput2::XIMasterRemoved) {
                 if let Ok(device_id) = xinput::DeviceId::try_from(info.deviceid) {
                     self.reset_pointer_capture(device_id, &mut callback);
                 }
-                callback(
-                    &self.target,
-                    Event::DeviceEvent {
-                        device_id: mkdid(info.deviceid as xinput::DeviceId),
-                        event: DeviceEvent::Removed,
-                    },
-                );
+                callback(&self.target, Event::DeviceEvent {
+                    device_id: mkdid(info.deviceid as xinput::DeviceId),
+                    event: DeviceEvent::Removed,
+                });
                 let mut devices = self.devices.borrow_mut();
                 devices.remove(&DeviceId(info.deviceid as xinput::DeviceId));
             }
@@ -2136,6 +2158,7 @@ impl EventProcessor {
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
+        wt.xconn.invalidate_work_area_authority();
         wt.xconn.reload_database().expect("failed to reload Xft database");
 
         // In the future, it would be quite easy to emit monitor hotplug events.
