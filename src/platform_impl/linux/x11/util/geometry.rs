@@ -122,7 +122,7 @@ impl XConnection {
             .ok();
 
         extents.and_then(|extents| {
-            if extents.len() >= 4 {
+            if extents.len() == 4 {
                 Some(FrameExtents {
                     left: extents[0],
                     right: extents[1],
@@ -169,6 +169,22 @@ impl XConnection {
             outer_window = candidate;
         }
         Ok(outer_window)
+    }
+
+    pub fn get_exact_frame_extents(
+        &self,
+        window: xproto::Window,
+        root: xproto::Window,
+    ) -> Result<Option<FrameExtents>, X11Error> {
+        let coordinates = self.translate_coords(window, root)?;
+        let nested = !(window == coordinates.child
+            || self.is_top_level(coordinates.child, root) == Some(true));
+        Ok(self.get_frame_extents(window).map(|mut extents| {
+            if !nested {
+                extents = FrameExtents::new(0, 0, 0, 0);
+            }
+            extents
+        }))
     }
 
     pub fn get_frame_extents_heuristic(

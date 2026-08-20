@@ -367,6 +367,19 @@ impl Window {
         x11_or_wayland!(match self; Window(w) => w.outer_size())
     }
 
+    #[cfg(x11_platform)]
+    pub(crate) fn x11_exact_outer_position_and_size(
+        &self,
+    ) -> Option<(PhysicalPosition<i32>, PhysicalSize<u32>)> {
+        match self {
+            Self::X(window) => window
+                .exact_outer_position_and_size()
+                .map(|(position, size)| (position.into(), size.into())),
+            #[cfg(wayland_platform)]
+            Self::Wayland(_) => None,
+        }
+    }
+
     #[inline]
     pub fn request_inner_size(&self, size: Size) -> Option<PhysicalSize<u32>> {
         x11_or_wayland!(match self; Window(w) => w.request_inner_size(size))

@@ -1067,9 +1067,12 @@ impl EventProcessor {
         // Since all XIM stuff needs to happen from the same thread, we destroy the input
         // context here instead of when dropping the window.
         if let Some(ime) = wt.ime.as_ref() {
-            ime.borrow_mut()
-                .remove_context(window as XWindow)
-                .expect("Failed to destroy input context");
+            // The platform window is already gone, so some XIM providers can
+            // report `BadWindow` while releasing the matching context. The
+            // local context entry is removed before that request; a late X11
+            // error must not turn an otherwise complete destruction event
+            // into a process-wide panic.
+            let _ = ime.borrow_mut().remove_context(window as XWindow);
         }
 
         callback(&self.target, Event::WindowEvent { window_id, event: WindowEvent::Destroyed });
@@ -1559,6 +1562,12 @@ impl EventProcessor {
 
         // Set the timestamp.
         wt.xconn.set_timestamp(xev.time as xproto::Timestamp);
+
+        // Focus events can trail `DestroyNotify`. Do not touch the input
+        // context or publish focus for an X window that no longer exists.
+        if !self.window_exists(window) {
+            return;
+        }
 
         if let Some(ime) = wt.ime.as_ref() {
             ime.borrow_mut().focus(xev.event).expect("Failed to focus input context");

@@ -244,9 +244,22 @@ impl<T> EventLoopBuilderExtX11 for EventLoopBuilder<T> {
 }
 
 /// Additional methods on [`Window`] that are specific to X11.
-pub trait WindowExtX11 {}
+pub trait WindowExtX11 {
+    /// Returns the exact physical outer position and size when the active X11
+    /// window manager publishes authoritative EWMH frame extents.
+    ///
+    /// `None` means the active backend is not X11 or the window manager only
+    /// permits a heuristic frame calculation. Callers must not promote that
+    /// absence into layout authority.
+    fn exact_outer_position_and_size(&self) -> Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>;
+}
 
-impl WindowExtX11 for Window {}
+impl WindowExtX11 for Window {
+    #[inline]
+    fn exact_outer_position_and_size(&self) -> Option<(PhysicalPosition<i32>, PhysicalSize<u32>)> {
+        self.window.x11_exact_outer_position_and_size()
+    }
+}
 
 /// Additional methods on [`WindowAttributes`] that are specific to X11.
 pub trait WindowAttributesExtX11 {

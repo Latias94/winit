@@ -799,7 +799,7 @@ impl UnownedWindow {
                         .expect("failed to set video mode");
                 }
 
-                let window_position = self.outer_position_physical();
+                let window_position = self.outer_position_physical()?;
                 self.shared_state_lock().restore_position = Some(window_position);
                 let monitor_origin: (i32, i32) = monitor.position().into();
                 self.set_position_inner(monitor_origin.0, monitor_origin.1)
@@ -1168,22 +1168,33 @@ impl UnownedWindow {
         self.shared_state_lock().frame_extents.take();
     }
 
-    pub(crate) fn outer_position_physical(&self) -> (i32, i32) {
+    pub(crate) fn outer_position_physical(&self) -> Result<(i32, i32), X11Error> {
         let extents = self.shared_state_lock().frame_extents.clone();
         if let Some(extents) = extents {
-            let (x, y) = self.inner_position_physical();
-            extents.inner_pos_to_outer(x, y)
+            let (x, y) = self.inner_position_physical()?;
+            Ok(extents.inner_pos_to_outer(x, y))
         } else {
             self.update_cached_frame_extents();
             self.outer_position_physical()
         }
     }
 
+    pub(crate) fn exact_outer_position_and_size(&self) -> Option<((i32, i32), (u32, u32))> {
+        let frame_extents = self.xconn.get_exact_frame_extents(self.xwindow, self.root).ok()??;
+        let (x, y) = self.inner_position_physical().ok()?;
+        let (width, height) = self
+            .xconn
+            .get_geometry(self.xwindow)
+            .ok()
+            .map(|geometry| (u32::from(geometry.width), u32::from(geometry.height)))?;
+        exact_outer_geometry((x, y), (width, height), &frame_extents)
+    }
+
     #[inline]
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         let extents = self.shared_state_lock().frame_extents.clone();
         if let Some(extents) = extents {
-            let (x, y) = self.inner_position_physical();
+            let (x, y) = self.inner_position_physical().map_err(|_| NotSupportedError::new())?;
             Ok(extents.inner_pos_to_outer(x, y).into())
         } else {
             self.update_cached_frame_extents();
@@ -1191,18 +1202,18 @@ impl UnownedWindow {
         }
     }
 
-    pub(crate) fn inner_position_physical(&self) -> (i32, i32) {
-        // This should be okay to unwrap since the only error XTranslateCoordinates can return
-        // is BadWindow, and if the window handle is bad we have bigger problems.
+    pub(crate) fn inner_position_physical(&self) -> Result<(i32, i32), X11Error> {
+        // A window can disappear between the host's close callback and the
+        // toolkit's final viewport-info update. Treat that race as an
+        // unavailable position instead of panicking on `BadWindow`.
         self.xconn
             .translate_coords(self.xwindow, self.root)
             .map(|coords| (coords.dst_x.into(), coords.dst_y.into()))
-            .unwrap()
     }
 
     #[inline]
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
-        Ok(self.inner_position_physical().into())
+        self.inner_position_physical().map(Into::into).map_err(|_| NotSupportedError::new())
     }
 
     pub(crate) fn set_position_inner(
@@ -1240,12 +1251,15 @@ impl UnownedWindow {
     }
 
     pub(crate) fn inner_size_physical(&self) -> (u32, u32) {
-        // This should be okay to unwrap since the only error XGetGeometry can return
-        // is BadWindow, and if the window handle is bad we have bigger problems.
-        self.xconn
-            .get_geometry(self.xwindow)
-            .map(|geo| (geo.width.into(), geo.height.into()))
-            .unwrap()
+        match self.xconn.get_geometry(self.xwindow) {
+            Ok(geometry) => (geometry.width.into(), geometry.height.into()),
+            Err(_) => {
+                // The host can request one final viewport-info update after a
+                // platform close has already destroyed the X window. Preserve
+                // the last ConfigureNotify size for that terminal update.
+                self.shared_state_lock().size.unwrap_or_default()
+            },
+        }
     }
 
     #[inline]
@@ -1934,5 +1948,48 @@ fn cast_size_to_hint(size: Size, scale_factor: f64) -> (i32, i32) {
     match size {
         Size::Physical(size) => cast_physical_size_to_hint(size),
         Size::Logical(size) => size.to_physical::<i32>(scale_factor).into(),
+    }
+}
+
+fn exact_outer_geometry(
+    (inner_x, inner_y): (i32, i32),
+    (inner_width, inner_height): (u32, u32),
+    frame_extents: &util::FrameExtents,
+) -> Option<((i32, i32), (u32, u32))> {
+    let left = i32::try_from(frame_extents.left).ok()?;
+    let top = i32::try_from(frame_extents.top).ok()?;
+    let outer_x = inner_x.checked_sub(left)?;
+    let outer_y = inner_y.checked_sub(top)?;
+    let outer_width =
+        inner_width.checked_add(frame_extents.left)?.checked_add(frame_extents.right)?;
+    let outer_height =
+        inner_height.checked_add(frame_extents.top)?.checked_add(frame_extents.bottom)?;
+    Some(((outer_x, outer_y), (outer_width, outer_height)))
+}
+
+#[cfg(test)]
+mod exact_outer_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn adds_authoritative_frame_extents_without_changing_coordinate_space() {
+        let extents = util::FrameExtents::new(3, 5, 20, 7);
+
+        assert_eq!(
+            exact_outer_geometry((103, 220), (640, 480), &extents),
+            Some(((100, 200), (648, 507)))
+        );
+    }
+
+    #[test]
+    fn rejects_coordinates_or_sizes_which_cannot_be_represented_exactly() {
+        assert_eq!(
+            exact_outer_geometry((i32::MIN, 0), (1, 1), &util::FrameExtents::new(1, 0, 0, 0)),
+            None
+        );
+        assert_eq!(
+            exact_outer_geometry((0, 0), (u32::MAX, 1), &util::FrameExtents::new(1, 0, 0, 0)),
+            None
+        );
     }
 }
