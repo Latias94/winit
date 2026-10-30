@@ -28,10 +28,10 @@ use sctk::seat::pointer::{
 };
 use sctk::seat::SeatState;
 
-use crate::dpi::{LogicalPosition, PhysicalPosition};
+use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use crate::event::{
-    ElementState, MouseButton, MouseScrollDelta, PointerEventFacts, PointerWindowRoute, TouchPhase,
-    WindowEvent,
+    ElementState, MouseButton, MouseScrollDelta, PointerEventFacts, PointerEventGeometry,
+    PointerWindowRoute, TouchPhase, WindowEvent,
 };
 
 use crate::platform_impl::wayland::state::WinitState;
@@ -84,8 +84,13 @@ impl PointerHandler for WinitState {
             };
 
             let scale_factor = window.scale_factor();
-            let position: PhysicalPosition<f64> =
-                LogicalPosition::new(event.position.0, event.position.1).to_physical(scale_factor);
+            let (position, geometry) = pointer_position_and_geometry(
+                LogicalPosition::new(event.position.0, event.position.1),
+                window.inner_size(),
+                scale_factor,
+            );
+            // Decoration positions are relative to a subsurface, not the parent's content area.
+            let geometry = (parent_surface == surface).then_some(geometry);
 
             match event.kind {
                 // Pointer movements on decorations.
@@ -151,6 +156,7 @@ impl PointerHandler for WinitState {
                             position,
                             facts: PointerEventFacts {
                                 surface_position: Some(position),
+                                geometry,
                                 desktop_position: None,
                                 modifiers: None,
                                 hover: if matches!(capture, PointerWindowRoute::None) {
@@ -187,6 +193,7 @@ impl PointerHandler for WinitState {
                             position,
                             facts: PointerEventFacts {
                                 surface_position: Some(position),
+                                geometry,
                                 desktop_position: None,
                                 modifiers: None,
                                 hover: if matches!(capture, PointerWindowRoute::None) {
@@ -241,6 +248,7 @@ impl PointerHandler for WinitState {
                             button,
                             facts: PointerEventFacts {
                                 surface_position: Some(position),
+                                geometry,
                                 desktop_position: None,
                                 modifiers: None,
                                 hover,
@@ -309,6 +317,7 @@ impl PointerHandler for WinitState {
                             phase,
                             facts: PointerEventFacts {
                                 surface_position: Some(position),
+                                geometry,
                                 desktop_position: None,
                                 modifiers: None,
                                 hover,
@@ -321,6 +330,19 @@ impl PointerHandler for WinitState {
             }
         }
     }
+}
+
+fn pointer_position_and_geometry(
+    position: LogicalPosition<f64>,
+    surface_size: LogicalSize<u32>,
+    scale_factor: f64,
+) -> (PhysicalPosition<f64>, PointerEventGeometry) {
+    // The caller holds the WindowState lock while freezing size, scale, and the physical point.
+    let geometry = PointerEventGeometry {
+        surface_size: wayland::logical_to_physical_rounded(surface_size, scale_factor),
+        scale_factor,
+    };
+    (position.to_physical(scale_factor), geometry)
 }
 
 #[derive(Debug)]
@@ -609,3 +631,23 @@ delegate_dispatch!(WinitState: [ WpCursorShapeDeviceV1: GlobalData] => SeatState
 delegate_dispatch!(WinitState: [ZwpPointerConstraintsV1: GlobalData] => PointerConstraintsState);
 delegate_dispatch!(WinitState: [ZwpLockedPointerV1: GlobalData] => PointerConstraintsState);
 delegate_dispatch!(WinitState: [ZwpConfinedPointerV1: GlobalData] => PointerConstraintsState);
+
+#[cfg(test)]
+mod tests {
+    use crate::dpi::PhysicalSize;
+
+    use super::*;
+
+    #[test]
+    fn local_pointer_geometry_uses_the_window_size_rounding_and_the_position_scale() {
+        let (position, geometry) = pointer_position_and_geometry(
+            LogicalPosition::new(-2.5, 10.25),
+            LogicalSize::new(101, 79),
+            1.5,
+        );
+
+        assert_eq!(position, PhysicalPosition::new(-3.75, 15.375));
+        assert_eq!(geometry.surface_size, PhysicalSize::new(152, 119));
+        assert_eq!(geometry.scale_factor, 1.5);
+    }
+}

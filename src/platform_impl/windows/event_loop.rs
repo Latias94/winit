@@ -1075,6 +1075,7 @@ fn wheel_event_facts(
 ) -> PointerEventFacts {
     PointerEventFacts {
         surface_position: wheel_surface_position(window, lparam),
+        geometry: None,
         desktop_position: Some(PhysicalPosition::new(
             f64::from(super::get_x_lparam(lparam as u32)),
             f64::from(super::get_y_lparam(lparam as u32)),
@@ -1118,6 +1119,7 @@ fn mouse_input_facts(
             f64::from(super::get_x_lparam(lparam as u32)),
             f64::from(super::get_y_lparam(lparam as u32)),
         )),
+        geometry: None,
         desktop_position: dispatched_desktop_position(window, message, wparam, lparam),
         modifiers: None,
         hover,
@@ -1823,6 +1825,7 @@ unsafe fn public_window_callback_inner(
                         position,
                         facts: PointerEventFacts {
                             surface_position: Some(position),
+                            geometry: None,
                             desktop_position: dispatched_desktop_position(
                                 window, msg, wparam, lparam,
                             ),

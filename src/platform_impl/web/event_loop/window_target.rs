@@ -374,6 +374,7 @@ impl ActiveEventLoop {
                                 button,
                                 facts: PointerEventFacts {
                                     surface_position: Some(position),
+                                    geometry: None,
                                     desktop_position: None,
                                     modifiers: Some(active_modifiers),
                                     hover: PointerWindowRoute::Window(RootWindowId(id)),
@@ -427,6 +428,7 @@ impl ActiveEventLoop {
                                 button,
                                 facts: PointerEventFacts {
                                     surface_position: Some(position),
+                                    geometry: None,
                                     desktop_position: None,
                                     modifiers: Some(active_modifiers),
                                     hover: PointerWindowRoute::Window(RootWindowId(id)),
@@ -509,6 +511,7 @@ impl ActiveEventLoop {
                                 button,
                                 facts: PointerEventFacts {
                                     surface_position: Some(position),
+                                    geometry: None,
                                     desktop_position: None,
                                     modifiers: Some(active_modifiers),
                                     hover: PointerWindowRoute::Window(RootWindowId(id)),
@@ -571,6 +574,7 @@ impl ActiveEventLoop {
                         phase: TouchPhase::Moved,
                         facts: PointerEventFacts {
                             surface_position: Some(position),
+                            geometry: None,
                             desktop_position: None,
                             modifiers: Some(active_modifiers),
                             hover: PointerWindowRoute::Window(RootWindowId(id)),

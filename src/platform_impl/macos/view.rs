@@ -31,7 +31,7 @@ use super::DEVICE_ID;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use crate::event::{
     DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta,
-    PointerEventFacts, PointerWindowRoute, TouchPhase, WindowEvent,
+    PointerEventFacts, PointerEventGeometry, PointerWindowRoute, TouchPhase, WindowEvent,
 };
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
 use crate::platform::macos::OptionAsAlt;
@@ -686,10 +686,11 @@ declare_class!(
 
             self.mouse_motion(event);
 
+            let (position, geometry) = self.event_position_and_geometry(event);
             let delta = {
                 let (x, y) = unsafe { (event.scrollingDeltaX(), event.scrollingDeltaY()) };
                 if unsafe { event.hasPreciseScrollingDeltas() } {
-                    let delta = LogicalPosition::new(x, y).to_physical(self.scale_factor());
+                    let delta = LogicalPosition::new(x, y).to_physical(geometry.scale_factor);
                     MouseScrollDelta::PixelDelta(delta)
                 } else {
                     MouseScrollDelta::LineDelta(x as f32, y as f32)
@@ -718,7 +719,12 @@ declare_class!(
                 device_id: DEVICE_ID,
                 delta,
                 phase,
-                facts: self.pointer_event_facts(event, self.scroll_capture_route()),
+                facts: self.pointer_event_facts_at(
+                    event,
+                    position,
+                    geometry,
+                    self.scroll_capture_route(),
+                ),
             });
         }
 
@@ -1123,6 +1129,11 @@ impl WinitView {
             }
         }
 
+        let (position, geometry) = pointer_position_and_geometry(
+            view_point,
+            LogicalSize::new(frame.size.width as f64, frame.size.height as f64),
+            self.scale_factor(),
+        );
         self.update_modifiers(event, false);
 
         let delivery = RootWindowId(self.window().id());
@@ -1133,13 +1144,22 @@ impl WinitView {
         );
         self.queue_event(WindowEvent::CursorMoved {
             device_id: DEVICE_ID,
-            position: view_point.to_physical(self.scale_factor()),
-            facts: self.cursor_moved_facts(event, view_point, capture),
+            position,
+            facts: self.pointer_event_facts_at(event, position, geometry, capture),
         });
     }
 
-    fn event_position(&self, event: &NSEvent) -> PhysicalPosition<f64> {
-        self.event_logical_position(event).to_physical(self.scale_factor())
+    fn event_position_and_geometry(
+        &self,
+        event: &NSEvent,
+    ) -> (PhysicalPosition<f64>, PointerEventGeometry) {
+        let position = self.event_logical_position(event);
+        let size = self.frame().size;
+        pointer_position_and_geometry(
+            position,
+            LogicalSize::new(size.width as f64, size.height as f64),
+            self.scale_factor(),
+        )
     }
 
     fn pointer_event_facts(
@@ -1147,27 +1167,20 @@ impl WinitView {
         event: &NSEvent,
         capture: PointerWindowRoute,
     ) -> PointerEventFacts {
-        let position = self.event_position(event);
-
-        PointerEventFacts {
-            surface_position: Some(position),
-            desktop_position: event_desktop_position(event),
-            modifiers: Some(event_mods(event).state()),
-            hover: self.pointer_hover_route(event),
-            capture,
-        }
+        let (position, geometry) = self.event_position_and_geometry(event);
+        self.pointer_event_facts_at(event, position, geometry, capture)
     }
 
-    fn cursor_moved_facts(
+    fn pointer_event_facts_at(
         &self,
         event: &NSEvent,
-        position: LogicalPosition<f64>,
+        position: PhysicalPosition<f64>,
+        geometry: PointerEventGeometry,
         capture: PointerWindowRoute,
     ) -> PointerEventFacts {
-        let position = position.to_physical(self.scale_factor());
-
         PointerEventFacts {
             surface_position: Some(position),
+            geometry: Some(geometry),
             desktop_position: event_desktop_position(event),
             modifiers: Some(event_mods(event).state()),
             hover: self.pointer_hover_route(event),
@@ -1208,6 +1221,17 @@ impl WinitView {
         let view_point = self.convertPoint_fromView(window_point, None);
         LogicalPosition::new(view_point.x, view_point.y)
     }
+}
+
+fn pointer_position_and_geometry(
+    position: LogicalPosition<f64>,
+    surface_size: LogicalSize<f64>,
+    scale_factor: f64,
+) -> (PhysicalPosition<f64>, PointerEventGeometry) {
+    // Use the same conversion as frameDidChange: and freeze both values before event delivery.
+    let geometry =
+        PointerEventGeometry { surface_size: surface_size.to_physical(scale_factor), scale_factor };
+    (position.to_physical(scale_factor), geometry)
 }
 
 fn classify_pointer_window_route(
@@ -1385,6 +1409,22 @@ mod pointer_route_tests {
     use core_graphics::geometry::CGSize;
 
     use super::*;
+
+    #[test]
+    fn local_pointer_position_and_geometry_share_the_frozen_scale() {
+        let logical_position = LogicalPosition::new(-2.5, 10.25);
+        let logical_size = LogicalSize::new(123.4, 80.5);
+        let (position, geometry) =
+            pointer_position_and_geometry(logical_position, logical_size, 1.5);
+
+        // A later conversion at another backing scale must not change the queued snapshot.
+        let later = pointer_position_and_geometry(logical_position, logical_size, 2.0);
+
+        assert_eq!(position, PhysicalPosition::new(-3.75, 15.375));
+        assert_eq!(geometry.surface_size, PhysicalSize::new(185, 121));
+        assert_eq!(geometry.scale_factor, 1.5);
+        assert_ne!((position, geometry), later);
+    }
 
     #[test]
     fn frontmost_winit_window_is_reported_exactly() {

@@ -147,16 +147,51 @@ pub enum StartCause {
     Init,
 }
 
+/// Local window geometry frozen when the backend produces a pointer event's physical position.
+///
+/// This is an observation of the event window's content area. It does not contain a desktop
+/// position or imply pointer hover or capture. The backend freezes it together with
+/// [`PointerEventFacts::surface_position`], before the event can be queued for later delivery.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerEventGeometry {
+    /// The content area's size in physical pixels, excluding window borders and decorations.
+    pub surface_size: PhysicalSize<u32>,
+
+    /// The native scale factor associated with this local geometry and physical position.
+    ///
+    /// This does not include an application's additional UI scaling.
+    pub scale_factor: f64,
+}
+
 /// Exact facts carried by the native event that produced a pointer input event.
 ///
 /// A missing field means that the platform backend could not report that fact from the same
 /// native event or callback. Consumers must not reconstruct missing values from cached cursor,
-/// modifier, or window geometry state.
+/// modifier, or later window geometry state.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PointerEventFacts {
     /// The event position in physical pixels relative to the top-left corner of the event window's
     /// content area.
     pub surface_position: Option<PhysicalPosition<f64>>,
+
+    /// Local geometry frozen by the backend when constructing [`Self::surface_position`].
+    ///
+    /// Consumers must not fill a missing value by querying window geometry at delivery time:
+    /// queued events can belong to an earlier size or scale. For [`WindowEvent::CursorMoved`],
+    /// the enclosing position and [`Self::surface_position`] use the same frozen physical point.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **macOS:** Mouse input, cursor motion, and wheel events freeze the view's content size
+    ///   and backing scale together with the physical position.
+    /// - **Wayland:** Main-surface mouse input, cursor motion, and wheel events freeze the local
+    ///   window state under the same lock used for position conversion. Size rounding matches
+    ///   [`Window::inner_size`].
+    /// - **X11:** Currently `None`. The existing ConfigureNotify size cache and monitor scale do
+    ///   not cover every DPI-change path as one coherent event-ordered snapshot. The backend does
+    ///   not query newer server geometry to fill this field for an older input event.
+    /// - **Other backends:** Currently `None`.
+    pub geometry: Option<PointerEventGeometry>,
 
     /// The event position in the platform's native global desktop coordinate space.
     ///

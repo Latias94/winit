@@ -1313,6 +1313,7 @@ impl EventProcessor {
 
         let facts = PointerEventFacts {
             surface_position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
+            geometry: None,
             desktop_position: Some(PhysicalPosition::new(event.root_x, event.root_y)),
             modifiers,
             hover,
@@ -1390,6 +1391,7 @@ impl EventProcessor {
         let capture = self.capture_for_button_state(event.deviceid, any_pressed);
         let facts = PointerEventFacts {
             surface_position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
+            geometry: None,
             desktop_position: Some(PhysicalPosition::new(event.root_x, event.root_y)),
             modifiers,
             hover,
@@ -1517,6 +1519,7 @@ impl EventProcessor {
                     position,
                     facts: PointerEventFacts {
                         surface_position: Some(position),
+                        geometry: None,
                         desktop_position: Some(desktop_position),
                         modifiers: None,
                         hover,
@@ -1618,6 +1621,7 @@ impl EventProcessor {
                 position,
                 facts: PointerEventFacts {
                     surface_position: Some(position),
+                    geometry: None,
                     desktop_position: None,
                     modifiers: None,
                     hover: PointerWindowRoute::Unknown,
@@ -1713,6 +1717,7 @@ impl EventProcessor {
                         position: location.cast(),
                         facts: PointerEventFacts {
                             surface_position: Some(location.cast()),
+                            geometry: None,
                             desktop_position: None,
                             modifiers: None,
                             hover: PointerWindowRoute::Unknown,
