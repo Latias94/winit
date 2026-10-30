@@ -414,6 +414,7 @@ impl<T: 'static> EventLoop<T> {
                                 device_id,
                                 phase,
                                 location,
+                                facts: event::PointerEventFacts::default(),
                                 id: pointer.pointer_id() as u64,
                                 force: Some(Force::Normalized(pointer.pressure() as f64)),
                             }),

@@ -152,6 +152,8 @@ pub enum StartCause {
 /// This is an observation of the event window's content area. It does not contain a desktop
 /// position or imply pointer hover or capture. The backend freezes it together with
 /// [`PointerEventFacts::surface_position`], before the event can be queued for later delivery.
+/// Wayland touch terminal events retain the last down/motion position and geometry pair;
+/// they do not sample new geometry when the contact ends or is cancelled.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PointerEventGeometry {
     /// The content area's size in physical pixels, excluding window borders and decorations.
@@ -168,6 +170,11 @@ pub struct PointerEventGeometry {
 /// A missing field means that the platform backend could not report that fact from the same
 /// native event or callback. Consumers must not reconstruct missing values from cached cursor,
 /// modifier, or later window geometry state.
+///
+/// Wayland [`TouchPhase::Ended`] and [`TouchPhase::Cancelled`] events have no new position.
+/// Their [`Touch::facts`] retain only the physical position and geometry pair frozen by the last
+/// down or motion for that contact. This pair is not a fresh terminal observation and must not
+/// be reinterpreted using a newer size or scale. Missing routes and other facts remain unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PointerEventFacts {
     /// The event position in physical pixels relative to the top-left corner of the event window's
@@ -184,9 +191,10 @@ pub struct PointerEventFacts {
     ///
     /// - **macOS:** Mouse input, cursor motion, and wheel events freeze the view's content size
     ///   and backing scale together with the physical position.
-    /// - **Wayland:** Main-surface mouse input, cursor motion, and wheel events freeze the local
-    ///   window state under the same lock used for position conversion. Size rounding matches
-    ///   [`Window::inner_size`].
+    /// - **Wayland:** Main-surface mouse input, cursor motion, wheel, and touch down/motion events
+    ///   freeze the local window state under the same lock used for position conversion. Size
+    ///   rounding matches [`Window::inner_size`]. Touch end/cancel retains the last down/motion
+    ///   position and geometry pair, without sampling the current window geometry.
     /// - **X11:** Currently `None`. The existing ConfigureNotify size cache and monitor scale do
     ///   not cover every DPI-change path as one coherent event-ordered snapshot. The backend does
     ///   not query newer server geometry to fill this field for an older input event.
@@ -953,7 +961,20 @@ pub enum TouchPhase {
 pub struct Touch {
     pub device_id: DeviceId,
     pub phase: TouchPhase,
+    /// The contact position in physical pixels relative to the window's content area.
+    ///
+    /// On Wayland, end/cancel keeps the physical position from the last down/motion, even if
+    /// the window's scale has since changed. The matching geometry is retained in [`Self::facts`].
     pub location: PhysicalPosition<f64>,
+    /// Optional facts frozen by the backend for this contact's position.
+    ///
+    /// Wayland down/motion freezes [`Self::location`], [`PointerEventFacts::surface_position`]
+    /// and [`PointerEventFacts::geometry`] together. End/cancel carries that last observed pair;
+    /// it is not a new coordinate sample. Desktop position and modifiers remain missing, and
+    /// hover and capture remain [`PointerWindowRoute::Unknown`]. Other backends currently report
+    /// default facts, so consumers must not infer missing geometry or routes from the location,
+    /// the event's delivery window, or later window state.
+    pub facts: PointerEventFacts,
     /// Describes how hard the screen was pressed. May be `None` if the platform
     /// does not support pressure sensitivity.
     ///
@@ -1205,6 +1226,7 @@ mod tests {
                     device_id: did,
                     phase: event::TouchPhase::Started,
                     location: (0.0, 0.0).into(),
+                    facts: event::PointerEventFacts::default(),
                     id: 0,
                     force: Some(event::Force::Normalized(0.0)),
                 }));
@@ -1294,6 +1316,7 @@ mod tests {
             device_id: did,
             phase: event::TouchPhase::Started,
             location: (0.0, 0.0).into(),
+            facts: event::PointerEventFacts::default(),
             id: 0,
             force: Some(event::Force::Normalized(0.0)),
         }

@@ -1735,6 +1735,7 @@ impl EventProcessor {
                     device_id: mkdid(xev.deviceid as xinput::DeviceId),
                     phase,
                     location,
+                    facts: PointerEventFacts::default(),
                     force: None, // TODO
                     id,
                 }),

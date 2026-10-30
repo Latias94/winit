@@ -317,6 +317,7 @@ impl ActiveEventLoop {
                                 phase: TouchPhase::Moved,
                                 force: Some(force),
                                 location,
+                                facts: PointerEventFacts::default(),
                             }),
                         },
                     )));
@@ -461,6 +462,7 @@ impl ActiveEventLoop {
                                 phase: TouchPhase::Started,
                                 force: Some(force),
                                 location,
+                                facts: PointerEventFacts::default(),
                             }),
                         },
                     )))
@@ -546,6 +548,7 @@ impl ActiveEventLoop {
                                 phase: TouchPhase::Ended,
                                 force: Some(force),
                                 location,
+                                facts: PointerEventFacts::default(),
                             }),
                         },
                     )));
@@ -595,6 +598,7 @@ impl ActiveEventLoop {
                     phase: TouchPhase::Cancelled,
                     force: Some(force),
                     location,
+                    facts: PointerEventFacts::default(),
                 }),
             });
         });

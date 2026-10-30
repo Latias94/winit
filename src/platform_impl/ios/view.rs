@@ -531,6 +531,7 @@ impl WinitView {
                     device_id: DEVICE_ID,
                     id: touch_id,
                     location: physical_location,
+                    facts: crate::event::PointerEventFacts::default(),
                     force,
                     phase,
                 }),

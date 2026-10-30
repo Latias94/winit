@@ -2217,6 +2217,7 @@ unsafe fn public_window_callback_inner(
                                 continue;
                             },
                             location,
+                            facts: PointerEventFacts::default(),
                             force: None, // WM_TOUCH doesn't support pressure information
                             id: input.dwID as u64,
                             device_id: DEVICE_ID,
@@ -2363,6 +2364,7 @@ unsafe fn public_window_callback_inner(
                                 continue;
                             },
                             location,
+                            facts: PointerEventFacts::default(),
                             force,
                             id: pointer_info.pointerId as u64,
                             device_id: DEVICE_ID,
