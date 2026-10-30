@@ -126,6 +126,7 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
+        let _dispatch = Self::window_target(&self.target).xconn.begin_native_event();
         self.process_xevent(xev, &mut callback);
 
         let window_target = Self::window_target_mut(&mut self.target);

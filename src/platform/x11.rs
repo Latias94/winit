@@ -8,6 +8,24 @@ use crate::window::{Window, WindowAttributes};
 
 use crate::dpi::{PhysicalPosition, PhysicalSize, Size};
 
+/// One fresh, synchronous observation of an exact X11 pointer.
+///
+/// This never creates a motion event, changes a grab, or consumes pending native events.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum X11PointerObservation {
+    /// Facts sampled after the preceding native event has been fully dispatched.
+    Observed {
+        /// Pointer facts independent of the requested window identity.
+        facts: crate::event::PointerEventFacts,
+        /// Native delivery, currently unknown because XIQueryPointer does not report grabs.
+        delivery: crate::event::PointerWindowRoute,
+    },
+    /// Native events, window/device changes, or an incomplete query prevent an ordered sample.
+    Unavailable,
+    /// The active backend or device does not support this observation.
+    Unsupported,
+}
+
 /// One monitor in an exact X11 work-area authority snapshot.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct X11WorkAreaRecord {
@@ -184,6 +202,27 @@ pub trait ActiveEventLoopExtX11 {
     /// relevant native event invalidates it. The current proof is limited to the X connection's
     /// first screen because Winit's X resource database uses that screen's root.
     fn work_area_authority_snapshot(&self) -> Option<X11WorkAreaAuthoritySnapshot>;
+
+    /// Samples a managed master pointer without replaying cached position or capture facts.
+    ///
+    /// `expected_window` must still identify the live source window. Pending native events and
+    /// calls made while a native event is being expanded return `Unavailable`, so callers must
+    /// drain and commit their own accepted input before trying again. Capture/delivery cannot
+    /// be reconstructed from Winit's retained implicit owner: XIQueryPointer reports neither
+    /// the current grab nor a protocol freeze. Both capture and delivery are currently unknown.
+    /// This observation therefore cannot authorize a stationary captured gesture. An unknown
+    /// route is never inferred from `expected_window`. X11 local event geometry is not supplied
+    /// by this desktop observation. Position describes the server's current logical state.
+    /// Hover names only a direct root child known to this event loop, or no child; a foreign or
+    /// window-manager frame returns Unknown because multiple hierarchy queries are not atomic.
+    /// This identifies that child's subtree, not an embedded child's deepest hit or delivery.
+    /// The expected window's viewability is checked before sampling; it is not an atomic part
+    /// of the root-pointer reply and grants no source-window authority.
+    fn observe_pointer(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: crate::event::DeviceId,
+    ) -> X11PointerObservation;
 }
 
 impl ActiveEventLoopExtX11 for ActiveEventLoop {
@@ -200,6 +239,21 @@ impl ActiveEventLoopExtX11 for ActiveEventLoop {
             },
             #[cfg(wayland_platform)]
             crate::platform_impl::ActiveEventLoop::Wayland(_) => None,
+        }
+    }
+
+    #[inline]
+    fn observe_pointer(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: crate::event::DeviceId,
+    ) -> X11PointerObservation {
+        match &self.p {
+            crate::platform_impl::ActiveEventLoop::X(event_loop) => {
+                event_loop.observe_pointer(expected_window, device_id)
+            },
+            #[cfg(wayland_platform)]
+            crate::platform_impl::ActiveEventLoop::Wayland(_) => X11PointerObservation::Unsupported,
         }
     }
 }

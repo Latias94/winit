@@ -44,6 +44,7 @@ pub mod ffi;
 mod ime;
 mod monitor;
 mod pointer_facts;
+mod pointer_observation;
 mod util;
 mod window;
 mod work_area;

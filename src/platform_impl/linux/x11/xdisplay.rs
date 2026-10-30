@@ -51,6 +51,9 @@ pub struct XConnection {
     /// Lazily refreshed exact EWMH/RandR work-area authority.
     pub(super) work_area_cache: Mutex<WorkAreaCache>,
 
+    /// Blocks synchronous observation until every callback from the current native event ends.
+    native_event_depth: AtomicU32,
+
     /// The resource database.
     database: RwLock<resource_manager::Database>,
 
@@ -64,6 +67,14 @@ pub struct XConnection {
     pub cursor_cache: Mutex<HashMap<Option<CursorIcon>, ffi::Cursor>>,
 }
 
+pub(super) struct NativeEventDispatchGuard(Arc<XConnection>);
+
+impl Drop for NativeEventDispatchGuard {
+    fn drop(&mut self) {
+        self.0.native_event_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 unsafe impl Send for XConnection {}
 unsafe impl Sync for XConnection {}
 
@@ -71,6 +82,17 @@ pub type XErrorHandler =
     Option<unsafe extern "C" fn(*mut ffi::Display, *mut ffi::XErrorEvent) -> std::os::raw::c_int>;
 
 impl XConnection {
+    pub(super) fn begin_native_event(self: &Arc<Self>) -> NativeEventDispatchGuard {
+        self.native_event_depth.fetch_add(1, Ordering::Relaxed);
+        NativeEventDispatchGuard(self.clone())
+    }
+
+    pub(super) fn pointer_observation_blocked(&self) -> bool {
+        // SAFETY: this is Winit's live display. XPending does not consume queued events.
+        self.native_event_depth.load(Ordering::Relaxed) != 0
+            || unsafe { (self.xlib.XPending)(self.display) } != 0
+    }
+
     pub fn new(error_handler: XErrorHandler) -> Result<XConnection, XNotSupported> {
         // opening the libraries
         let xlib = ffi::Xlib::open()?;
@@ -141,6 +163,7 @@ impl XConnection {
             latest_error: Mutex::new(None),
             monitor_handles: Mutex::new(None),
             work_area_cache: Mutex::new(WorkAreaCache::new()),
+            native_event_depth: AtomicU32::new(0),
             database: RwLock::new(database),
             cursor_cache: Default::default(),
             randr_version: (randr_version.major_version, randr_version.minor_version),
