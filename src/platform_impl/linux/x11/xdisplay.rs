@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::{fmt, ptr};
 
+use crate::event::PointerPressToken;
 use crate::window::CursorIcon;
 
 use super::atoms::Atoms;
@@ -88,6 +89,21 @@ pub type XErrorHandler =
 impl XConnection {
     pub(super) fn pointer_captures(&self) -> MutexGuard<'_, ImplicitPointerCaptures> {
         self.pointer_captures.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(super) fn primary_press(&self, window: u32, device: u16) -> Option<PointerPressToken> {
+        let (domain, sequence) = self.pointer_captures().primary_press(device, window)?;
+        Some(PointerPressToken::from_x11(domain, sequence))
+    }
+
+    pub(super) fn validate_primary_press(
+        &self,
+        window: u32,
+        device: u16,
+        expected: &PointerPressToken,
+    ) -> bool {
+        let (domain, sequence) = expected.x11_identity();
+        self.pointer_captures().validate_primary_press(device, window, domain, sequence)
     }
 
     pub(super) fn with_pointer_capture_mutation<R>(

@@ -1937,6 +1937,7 @@ unsafe fn public_window_callback_inner(
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
+                    primary_press: None,
                     device_id: DEVICE_ID,
                     state: Pressed,
                     button: Left,
@@ -1965,6 +1966,7 @@ unsafe fn public_window_callback_inner(
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
+                    primary_press: None,
                     device_id: DEVICE_ID,
                     state: Released,
                     button: Left,
@@ -1993,6 +1995,7 @@ unsafe fn public_window_callback_inner(
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
+                    primary_press: None,
                     device_id: DEVICE_ID,
                     state: Pressed,
                     button: Right,
@@ -2021,6 +2024,7 @@ unsafe fn public_window_callback_inner(
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
+                    primary_press: None,
                     device_id: DEVICE_ID,
                     state: Released,
                     button: Right,
@@ -2049,6 +2053,7 @@ unsafe fn public_window_callback_inner(
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
+                    primary_press: None,
                     device_id: DEVICE_ID,
                     state: Pressed,
                     button: Middle,
@@ -2077,6 +2082,7 @@ unsafe fn public_window_callback_inner(
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
+                    primary_press: None,
                     device_id: DEVICE_ID,
                     state: Released,
                     button: Middle,
@@ -2106,6 +2112,7 @@ unsafe fn public_window_callback_inner(
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
+                    primary_press: None,
                     device_id: DEVICE_ID,
                     state: Pressed,
                     button: match xbutton {
@@ -2139,6 +2146,7 @@ unsafe fn public_window_callback_inner(
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
+                    primary_press: None,
                     device_id: DEVICE_ID,
                     state: Released,
                     button: match xbutton {

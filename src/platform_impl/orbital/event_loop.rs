@@ -433,6 +433,7 @@ impl<T: 'static> EventLoop<T> {
                     event_handler(event::Event::WindowEvent {
                         window_id: RootWindowId(window_id),
                         event: event::WindowEvent::MouseInput {
+                            primary_press: None,
                             device_id: event::DeviceId(DeviceId),
                             state,
                             button,

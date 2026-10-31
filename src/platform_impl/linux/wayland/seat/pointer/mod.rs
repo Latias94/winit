@@ -243,6 +243,7 @@ impl PointerHandler for WinitState {
                     };
                     self.events_sink.push_window_event(
                         WindowEvent::MouseInput {
+                            primary_press: None,
                             device_id,
                             state,
                             button,

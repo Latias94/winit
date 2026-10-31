@@ -1106,6 +1106,7 @@ impl WinitView {
         self.update_modifiers(event, false);
 
         self.queue_event(WindowEvent::MouseInput {
+            primary_press: None,
             device_id: DEVICE_ID,
             state: button_state,
             button,

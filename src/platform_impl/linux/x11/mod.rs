@@ -58,6 +58,7 @@ use dnd::{Dnd, DndState};
 use event_processor::{EventProcessor, MAX_MOD_REPLAY_LEN};
 use ime::{Ime, ImeCreationError, ImeReceiver, ImeRequest, ImeSender};
 pub(crate) use monitor::{MonitorHandle, VideoModeHandle};
+pub(crate) use pointer_facts::PointerPressConnectionDomain;
 use window::UnownedWindow;
 pub(crate) use xdisplay::{XConnection, XError, XNotSupported};
 

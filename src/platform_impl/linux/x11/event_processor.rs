@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroU64;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::slice;
 use std::sync::{Arc, Mutex};
@@ -21,14 +22,15 @@ use x11rb::x11_utils::{ExtensionInformation, Serialize};
 use xkbcommon_dl::xkb_mod_mask_t;
 
 use super::pointer_facts::{
-    button_state_transition, classify_pointer_hierarchy, fp1616_matches_event,
-    ButtonStateTransition, NativePointerRoute,
+    button_state_transition, classify_pointer_hierarchy, current_button_state,
+    fp1616_matches_event, ButtonStateTransition, NativePointerRoute, PointerButtonState,
 };
 
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::event::{
     DeviceEvent, ElementState, Event, Ime, InnerSizeWriter, MouseButton, MouseScrollDelta,
-    PointerEventFacts, PointerWindowRoute, RawKeyEvent, Touch, TouchPhase, WindowEvent,
+    PointerEventFacts, PointerPressToken, PointerWindowRoute, RawKeyEvent, Touch, TouchPhase,
+    WindowEvent,
 };
 use crate::event_loop::ActiveEventLoop as RootAEL;
 use crate::keyboard::ModifiersState;
@@ -84,10 +86,8 @@ fn xi_button_state_transition(
     button_state_transition(xi_button_mask(buttons)?, detail, state == ElementState::Pressed)
 }
 
-fn xi_any_button_pressed(buttons: &xinput2::XIButtonState) -> Option<bool> {
-    xi_button_mask(buttons)
-        .filter(|mask| !mask.is_empty())
-        .map(|mask| mask.iter().any(|byte| *byte != 0))
+fn xi_current_button_state(buttons: &xinput2::XIButtonState) -> Option<PointerButtonState> {
+    current_button_state(xi_button_mask(buttons)?)
 }
 
 pub struct EventProcessor {
@@ -283,14 +283,21 @@ impl EventProcessor {
                             xi_button_state_transition(&xev.buttons, xev.detail, state);
                         // ModifiersChanged can reenter window mutation APIs. Record this native
                         // edge first, then only reread the owner after the callback returns.
-                        self.record_button_capture(xev, state, transition);
+                        let primary_press = self.record_button_capture(xev, state, transition);
                         let modifiers = self.update_mods_from_xinput2_event(
                             &xev.mods,
                             &xev.group,
                             false,
                             &mut callback,
                         );
-                        self.xinput2_button_input(xev, state, transition, modifiers, &mut callback);
+                        self.xinput2_button_input(
+                            xev,
+                            state,
+                            transition,
+                            modifiers,
+                            primary_press,
+                            &mut callback,
+                        );
                     },
                     xinput2::XI_Motion => {
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
@@ -555,35 +562,72 @@ impl EventProcessor {
         event: &XIDeviceEvent,
         state: ElementState,
         transition: Option<ButtonStateTransition>,
-    ) {
+    ) -> Option<PointerPressToken> {
         if event.send_event != xlib::False || (event.flags & xinput2::XIPointerEmulated) != 0 {
-            return;
+            return None;
         }
         let Ok(device_id) = xinput::DeviceId::try_from(event.deviceid) else {
-            return;
+            return None;
         };
         let delivery_window = event.event as xproto::Window;
         let delivery_is_winit = self.window_exists(delivery_window);
         let wt = Self::window_target(&self.target);
-        wt.xconn.pointer_captures().after_button_event(
-            device_id,
-            delivery_window,
-            delivery_is_winit,
-            state == ElementState::Pressed,
-            transition,
-        );
+        let primary_edge = event.detail == xlib::Button1 as c_int;
+        // A release carries only historical correlation. Remove its active qualification before
+        // any request or callback can run, even while a Secondary button keeps capture alive.
+        let (released_primary, candidate) = {
+            let mut captures = wt.xconn.pointer_captures();
+            let released_primary = (primary_edge && state == ElementState::Released)
+                .then(|| captures.primary_press(device_id, delivery_window))
+                .flatten();
+            captures.after_button_event(
+                device_id,
+                delivery_window,
+                delivery_is_winit,
+                state == ElementState::Pressed,
+                transition,
+            );
+            let candidate = (primary_edge
+                && state == ElementState::Pressed
+                && transition.is_some_and(|transition| {
+                    !transition.primary_before && transition.primary_after
+                }))
+            .then(|| captures.primary_press_candidate(device_id, delivery_window))
+            .flatten();
+            (released_primary, candidate)
+        };
+        if let Some(candidate) = candidate {
+            // This validates the original event window before issuing its identity. Keep both
+            // request dispatch and reply processing outside the capture mutex and Display locks:
+            // Xlib/XCB error hooks may reenter mutation paths and revoke this pending candidate.
+            let sequence = (|| {
+                let cookie =
+                    wt.xconn.xcb_connection().get_window_attributes(delivery_window).ok()?;
+                let sequence = NonZeroU64::new(cookie.sequence_number())?;
+                let attributes = cookie.reply().ok()?;
+                (attributes.map_state == xproto::MapState::VIEWABLE).then_some(sequence)
+            })();
+            wt.xconn.pointer_captures().complete_primary_press(candidate, sequence);
+        }
+        if state == ElementState::Released {
+            released_primary.map(|(domain, sequence)| PointerPressToken::from_x11(domain, sequence))
+        } else if primary_edge {
+            wt.xconn.primary_press(delivery_window, device_id)
+        } else {
+            None
+        }
     }
 
     fn capture_for_button_state(
         &self,
         device_id: c_int,
-        any_pressed: Option<bool>,
+        buttons: Option<PointerButtonState>,
     ) -> PointerWindowRoute {
         let Ok(device_id) = xinput::DeviceId::try_from(device_id) else {
             return PointerWindowRoute::Unknown;
         };
         let wt = Self::window_target(&self.target);
-        let route = wt.xconn.pointer_captures().for_button_state(device_id, any_pressed);
+        let route = wt.xconn.pointer_captures().for_button_state(device_id, buttons);
         self.validate_window_route(route)
     }
 
@@ -1312,6 +1356,7 @@ impl EventProcessor {
         state: ElementState,
         transition: Option<ButtonStateTransition>,
         modifiers: Option<ModifiersState>,
+        primary_press: Option<PointerPressToken>,
         mut callback: F,
     ) where
         F: FnMut(&RootAEL, Event<T>),
@@ -1339,7 +1384,7 @@ impl EventProcessor {
         let capture = if event.send_event == xlib::False {
             self.capture_for_button_state(
                 event.deviceid,
-                transition.map(|transition| transition.any_after),
+                transition.map(ButtonStateTransition::after),
             )
         } else {
             PointerWindowRoute::Unknown
@@ -1353,16 +1398,39 @@ impl EventProcessor {
             hover,
             capture,
         };
+        // ModifiersChanged and hover queries can reenter mutation APIs after the edge was
+        // recorded. Validate this exact press instead of borrowing whichever press is current.
+        // Release identities are historical only; record_button_capture already revoked them.
+        let primary_press = primary_press.filter(|expected| {
+            state == ElementState::Released
+                || wt.xconn.validate_primary_press(
+                    event.event as xproto::Window,
+                    event.deviceid as xinput::DeviceId,
+                    expected,
+                )
+        });
         let event = match event.detail as u32 {
-            xlib::Button1 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Left, facts }
+            xlib::Button1 => WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Left,
+                primary_press,
+                facts,
             },
-            xlib::Button2 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle, facts }
+            xlib::Button2 => WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Middle,
+                primary_press: None,
+                facts,
             },
 
-            xlib::Button3 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Right, facts }
+            xlib::Button3 => WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Right,
+                primary_press: None,
+                facts,
             },
 
             // Suppress emulated scroll wheel clicks, since we handle the real motion events for
@@ -1381,13 +1449,26 @@ impl EventProcessor {
                 phase: TouchPhase::Moved,
                 facts,
             },
-            8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back, facts },
+            8 => WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Back,
+                primary_press: None,
+                facts,
+            },
 
-            9 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Forward, facts },
+            9 => WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Forward,
+                primary_press: None,
+                facts,
+            },
             x => WindowEvent::MouseInput {
                 device_id,
                 state,
                 button: MouseButton::Other(x as u16),
+                primary_press: None,
                 facts,
             },
         };
@@ -1413,17 +1494,17 @@ impl EventProcessor {
         let window = event.event as xproto::Window;
         let window_id = mkwid(window);
         let new_cursor_pos = (event.event_x, event.event_y);
-        let any_pressed = xi_any_button_pressed(&event.buttons);
+        let buttons = xi_current_button_state(&event.buttons);
         let hover = self.hover_route(
             event.root,
             event.root_x,
             event.root_y,
             event.deviceid,
             window,
-            any_pressed,
+            buttons.map(|buttons| buttons.any_pressed),
         );
         let capture = if event.send_event == xlib::False {
-            self.capture_for_button_state(event.deviceid, any_pressed)
+            self.capture_for_button_state(event.deviceid, buttons)
         } else {
             PointerWindowRoute::Unknown
         };
@@ -1502,7 +1583,7 @@ impl EventProcessor {
                 &mut scroll_event
             {
                 facts.capture = if event.send_event == xlib::False {
-                    self.capture_for_button_state(event.deviceid, any_pressed)
+                    self.capture_for_button_state(event.deviceid, buttons)
                 } else {
                     PointerWindowRoute::Unknown
                 };
@@ -1546,21 +1627,21 @@ impl EventProcessor {
         if self.window_exists(window) {
             let position = PhysicalPosition::new(event.event_x, event.event_y);
             let desktop_position = PhysicalPosition::new(event.root_x, event.root_y);
-            let any_pressed = xi_any_button_pressed(&event.buttons);
+            let buttons = xi_current_button_state(&event.buttons);
             let hover = self.hover_route(
                 event.root,
                 event.root_x,
                 event.root_y,
                 event.deviceid,
                 window,
-                any_pressed,
+                buttons.map(|buttons| buttons.any_pressed),
             );
             let entered =
                 Event::WindowEvent { window_id, event: WindowEvent::CursorEntered { device_id } };
             callback(&self.target, entered);
 
             let capture = if event.send_event == xlib::False {
-                self.capture_for_button_state(event.deviceid, any_pressed)
+                self.capture_for_button_state(event.deviceid, buttons)
             } else {
                 PointerWindowRoute::Unknown
             };

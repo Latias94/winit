@@ -2,9 +2,10 @@
 //! transitions run as ordinary unit tests on non-X11 development hosts.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Bound hierarchy probing so a malformed or concurrently changing X11 window tree fails closed.
 const MAX_POINTER_HIERARCHY_DEPTH: usize = 64;
@@ -32,10 +33,49 @@ impl ImplicitCaptureOwner {
     }
 }
 
+/// One connection lifetime, kept alive by every public token minted by this owner.
+#[derive(Debug, Default)]
+pub(crate) struct PointerPressConnectionDomain;
+
+#[derive(Debug)]
+struct PrimaryPressCandidateIdentity;
+
+/// A pending validation owns this allocation across the unlocked XCB request/reply.
+#[derive(Debug)]
+pub(super) struct PrimaryPressCandidate {
+    device: u16,
+    window: u32,
+    identity: Arc<PrimaryPressCandidateIdentity>,
+}
+
+#[derive(Debug)]
+enum PrimaryPressState {
+    Pending(Arc<PrimaryPressCandidateIdentity>),
+    Active(NonZeroU64),
+}
+
+#[derive(Debug)]
+struct ImplicitPointerCapture {
+    owner: ImplicitCaptureOwner,
+    primary: Option<PrimaryPressState>,
+}
+
+impl ImplicitPointerCapture {
+    fn new(owner: ImplicitCaptureOwner) -> Self {
+        Self { owner, primary: None }
+    }
+
+    fn invalidate(&mut self) {
+        self.owner = ImplicitCaptureOwner::Unknown;
+        self.primary = None;
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ImplicitPointerCaptures {
-    owners: HashMap<u16, ImplicitCaptureOwner>,
+    owners: HashMap<u16, ImplicitPointerCapture>,
     fence: CaptureMutationFence,
+    domain: Arc<PointerPressConnectionDomain>,
 }
 
 /// Bracket request dispatch without holding either a Display lock or the capture mutex.
@@ -81,11 +121,12 @@ impl ImplicitPointerCaptures {
     // Keep invalidated devices until an observed all-up state. A later first-press mask alone
     // must not resurrect the owner of a stream whose continuity was lost.
     pub(super) fn invalidate(&mut self, window: Option<u32>) {
-        for owner in self.owners.values_mut() {
+        for capture in self.owners.values_mut() {
             if window.is_none()
-                || window.is_some_and(|window| *owner == ImplicitCaptureOwner::Window(window))
+                || window
+                    .is_some_and(|window| capture.owner == ImplicitCaptureOwner::Window(window))
             {
-                *owner = ImplicitCaptureOwner::Unknown;
+                capture.invalidate();
             }
         }
         self.close_fence();
@@ -108,8 +149,8 @@ impl ImplicitPointerCaptures {
 
     pub(super) fn finish_sync(&mut self, succeeded: bool) {
         if !succeeded {
-            for owner in self.owners.values_mut() {
-                *owner = ImplicitCaptureOwner::Unknown;
+            for capture in self.owners.values_mut() {
+                capture.invalidate();
             }
             self.fence = CaptureMutationFence::Failed;
         } else if self.fence == CaptureMutationFence::Syncing {
@@ -134,7 +175,8 @@ impl ImplicitPointerCaptures {
         transition: Option<ButtonStateTransition>,
     ) -> NativePointerRoute {
         let Some(transition) = transition else {
-            self.owners.insert(device_id, ImplicitCaptureOwner::Unknown);
+            self.owners
+                .insert(device_id, ImplicitPointerCapture::new(ImplicitCaptureOwner::Unknown));
             return NativePointerRoute::Unknown;
         };
 
@@ -152,40 +194,136 @@ impl ImplicitPointerCaptures {
             } else {
                 ImplicitCaptureOwner::Unknown
             };
-            self.owners.insert(device_id, owner);
-            return owner.route();
+            self.owners.insert(device_id, ImplicitPointerCapture::new(owner));
         }
 
-        self.owners.entry(device_id).or_insert(ImplicitCaptureOwner::Unknown).route()
+        let capture = self
+            .owners
+            .entry(device_id)
+            .or_insert_with(|| ImplicitPointerCapture::new(ImplicitCaptureOwner::Unknown));
+        if !transition.primary_after {
+            // Primary ends independently of the implicit grab, which lasts until all buttons are
+            // up.
+            capture.primary = None;
+        } else if pressed && !transition.primary_before {
+            capture.primary = (delivery_is_winit
+                && self.fence == CaptureMutationFence::Open
+                && capture.owner == ImplicitCaptureOwner::Window(delivery_window)
+                && capture.primary.is_none())
+            .then(|| PrimaryPressState::Pending(Arc::new(PrimaryPressCandidateIdentity)));
+        }
+        capture.owner.route()
+    }
+
+    pub(super) fn primary_press_candidate(
+        &self,
+        device: u16,
+        window: u32,
+    ) -> Option<PrimaryPressCandidate> {
+        let capture = self.owners.get(&device)?;
+        if self.fence != CaptureMutationFence::Open
+            || capture.owner != ImplicitCaptureOwner::Window(window)
+        {
+            return None;
+        }
+        let PrimaryPressState::Pending(identity) = capture.primary.as_ref()? else {
+            return None;
+        };
+        Some(PrimaryPressCandidate { device, window, identity: Arc::clone(identity) })
+    }
+
+    pub(super) fn complete_primary_press(
+        &mut self,
+        candidate: PrimaryPressCandidate,
+        sequence: Option<NonZeroU64>,
+    ) {
+        let Some(capture) = self.owners.get_mut(&candidate.device) else {
+            return;
+        };
+        if !matches!(capture.primary.as_ref(), Some(PrimaryPressState::Pending(identity))
+            if Arc::ptr_eq(identity, &candidate.identity))
+        {
+            return;
+        }
+        // Consume this exact pending validation even on failure. A repeated press cannot retry it.
+        capture.primary = None;
+        if self.fence == CaptureMutationFence::Open
+            && capture.owner == ImplicitCaptureOwner::Window(candidate.window)
+        {
+            capture.primary = sequence.map(PrimaryPressState::Active);
+        }
+    }
+
+    pub(super) fn primary_press(
+        &self,
+        device: u16,
+        window: u32,
+    ) -> Option<(Arc<PointerPressConnectionDomain>, NonZeroU64)> {
+        let capture = self.owners.get(&device)?;
+        if self.fence != CaptureMutationFence::Open
+            || capture.owner != ImplicitCaptureOwner::Window(window)
+        {
+            return None;
+        }
+        let PrimaryPressState::Active(sequence) = capture.primary.as_ref()? else {
+            return None;
+        };
+        Some((Arc::clone(&self.domain), *sequence))
+    }
+
+    pub(super) fn validate_primary_press(
+        &self,
+        device: u16,
+        window: u32,
+        domain: &Arc<PointerPressConnectionDomain>,
+        sequence: NonZeroU64,
+    ) -> bool {
+        self.fence == CaptureMutationFence::Open
+            && Arc::ptr_eq(&self.domain, domain)
+            && self.owners.get(&device).is_some_and(|capture| {
+                capture.owner == ImplicitCaptureOwner::Window(window)
+                    && matches!(capture.primary.as_ref(), Some(PrimaryPressState::Active(current))
+                        if *current == sequence)
+            })
     }
 
     pub(super) fn for_button_state(
         &mut self,
         device_id: u16,
-        any_pressed: Option<bool>,
+        buttons: Option<PointerButtonState>,
     ) -> NativePointerRoute {
-        match any_pressed {
-            Some(false) => {
+        match buttons {
+            Some(PointerButtonState { any_pressed: false, .. }) => {
                 self.owners.remove(&device_id);
                 NativePointerRoute::None
             },
-            Some(true) => {
-                self.owners.entry(device_id).or_insert(ImplicitCaptureOwner::Unknown).route()
+            Some(buttons) => {
+                let capture = self
+                    .owners
+                    .entry(device_id)
+                    .or_insert_with(|| ImplicitPointerCapture::new(ImplicitCaptureOwner::Unknown));
+                if !buttons.primary_pressed {
+                    // A motion/enter mask can reveal a lost Primary release while another
+                    // button still holds the implicit grab. Observations never mint a press.
+                    capture.primary = None;
+                }
+                capture.owner.route()
             },
             None => {
-                self.owners.insert(device_id, ImplicitCaptureOwner::Unknown);
+                self.owners
+                    .insert(device_id, ImplicitPointerCapture::new(ImplicitCaptureOwner::Unknown));
                 NativePointerRoute::Unknown
             },
         }
     }
 
     pub(super) fn reset_device(&mut self, device_id: u16) -> Option<u32> {
-        let owner = self.owners.get_mut(&device_id)?;
-        let window = match *owner {
+        let capture = self.owners.get_mut(&device_id)?;
+        let window = match capture.owner {
             ImplicitCaptureOwner::Window(window) => window,
             ImplicitCaptureOwner::Unknown => return None,
         };
-        *owner = ImplicitCaptureOwner::Unknown;
+        capture.invalidate();
         self.close_fence();
         Some(window)
     }
@@ -198,12 +336,14 @@ impl ImplicitPointerCaptures {
         let devices = self
             .owners
             .iter()
-            .filter_map(|(device_id, owner)| {
-                (*owner == ImplicitCaptureOwner::Window(window)).then_some(*device_id)
+            .filter_map(|(device_id, capture)| {
+                (capture.owner == ImplicitCaptureOwner::Window(window)).then_some(*device_id)
             })
             .collect::<Vec<_>>();
         for device_id in &devices {
-            self.owners.insert(*device_id, ImplicitCaptureOwner::Unknown);
+            if let Some(capture) = self.owners.get_mut(device_id) {
+                capture.invalidate();
+            }
         }
         self.close_fence();
         devices
@@ -214,6 +354,28 @@ impl ImplicitPointerCaptures {
 pub(super) struct ButtonStateTransition {
     pub(super) any_before: bool,
     pub(super) any_after: bool,
+    pub(super) primary_before: bool,
+    pub(super) primary_after: bool,
+}
+
+impl ButtonStateTransition {
+    pub(super) fn after(self) -> PointerButtonState {
+        PointerButtonState { any_pressed: self.any_after, primary_pressed: self.primary_after }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PointerButtonState {
+    pub(super) any_pressed: bool,
+    pub(super) primary_pressed: bool,
+}
+
+pub(super) fn current_button_state(mask: &[u8]) -> Option<PointerButtonState> {
+    let first = *mask.first()?;
+    Some(PointerButtonState {
+        any_pressed: mask.iter().any(|byte| *byte != 0),
+        primary_pressed: first & (1 << 1) != 0,
+    })
 }
 
 pub(super) fn button_state_transition(
@@ -237,7 +399,9 @@ pub(super) fn button_state_transition(
         any_after |= pressed_after;
     }
 
-    Some(ButtonStateTransition { any_before, any_after })
+    let primary_before = mask[0] & (1 << 1) != 0;
+    let primary_after = if detail == 1 { pressed } else { primary_before };
+    Some(ButtonStateTransition { any_before, any_after, primary_before, primary_after })
 }
 
 pub(super) fn classify_pointer_hierarchy(
@@ -282,16 +446,359 @@ mod tests {
     const OTHER_WINDOW: u32 = 200;
 
     fn transition(any_before: bool, any_after: bool) -> Option<ButtonStateTransition> {
-        Some(ButtonStateTransition { any_before, any_after })
+        Some(ButtonStateTransition {
+            any_before,
+            any_after,
+            primary_before: any_before,
+            primary_after: any_after,
+        })
+    }
+
+    fn begin_primary_validation(
+        captures: &mut ImplicitPointerCaptures,
+        device: u16,
+        window: u32,
+    ) -> PrimaryPressCandidate {
+        assert_eq!(
+            captures.after_button_event(
+                device,
+                window,
+                true,
+                true,
+                button_state_transition(&[0], 1, true),
+            ),
+            NativePointerRoute::Window(window)
+        );
+        captures.primary_press_candidate(device, window).expect("the first Primary edge is pending")
+    }
+
+    fn validated_primary(
+        captures: &mut ImplicitPointerCaptures,
+        device: u16,
+        window: u32,
+        sequence: u64,
+    ) -> (Arc<PointerPressConnectionDomain>, NonZeroU64) {
+        let candidate = begin_primary_validation(captures, device, window);
+        captures.complete_primary_press(candidate, NonZeroU64::new(sequence));
+        captures.primary_press(device, window).expect("the window validation completed")
+    }
+
+    #[test]
+    fn current_primary_up_revokes_identity_while_secondary_motion_keeps_capture() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let (domain, sequence) = validated_primary(&mut captures, DEVICE, OWNER, 11);
+        // No Primary release edge was delivered. The next native motion/enter mask still
+        // observes Secondary down, so it must revoke only the Primary qualification.
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_1000])),
+            NativePointerRoute::Window(OWNER)
+        );
+        assert!(!captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        assert!(captures.primary_press(DEVICE, OWNER).is_none());
+        assert!(captures.primary_press_candidate(DEVICE, OWNER).is_none());
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_1010])),
+            NativePointerRoute::Window(OWNER)
+        );
+        assert!(captures.primary_press(DEVICE, OWNER).is_none(), "motion cannot mint a new press");
+        assert!(captures.primary_press_candidate(DEVICE, OWNER).is_none());
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[])),
+            NativePointerRoute::Unknown
+        );
+        assert!(!captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+
+        captures.for_button_state(DEVICE, current_button_state(&[0]));
+        let pending = begin_primary_validation(&mut captures, DEVICE, OWNER);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_1000])),
+            NativePointerRoute::Window(OWNER)
+        );
+        captures.complete_primary_press(pending, NonZeroU64::new(12));
+        assert!(
+            captures.primary_press(DEVICE, OWNER).is_none(),
+            "a released candidate cannot complete"
+        );
+    }
+
+    #[test]
+    fn non_primary_edges_never_reissue_primary_identity() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let (domain, sequence) = validated_primary(&mut captures, DEVICE, OWNER, 13);
+        for (mask, pressed) in [(0b0000_0010, true), (0b0000_1010, false)] {
+            assert_eq!(
+                captures.after_button_event(
+                    DEVICE,
+                    OWNER,
+                    true,
+                    pressed,
+                    button_state_transition(&[mask], 3, pressed),
+                ),
+                NativePointerRoute::Window(OWNER)
+            );
+            assert!(captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+            assert!(captures.primary_press_candidate(DEVICE, OWNER).is_none());
+        }
+    }
+
+    #[test]
+    fn primary_release_revokes_identity_before_secondary_releases_capture() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let (domain, sequence) = validated_primary(&mut captures, DEVICE, OWNER, 17);
+        assert!(captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        assert!(!captures.validate_primary_press(DEVICE + 1, OWNER, &domain, sequence));
+        assert!(!captures.validate_primary_press(DEVICE, OTHER_WINDOW, &domain, sequence));
+        assert_eq!(
+            captures.after_button_event(
+                DEVICE,
+                OWNER,
+                true,
+                true,
+                button_state_transition(&[0b0000_0010], 3, true),
+            ),
+            NativePointerRoute::Window(OWNER)
+        );
+        assert!(captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        assert_eq!(
+            captures.after_button_event(
+                DEVICE,
+                OWNER,
+                true,
+                false,
+                button_state_transition(&[0b0000_1010], 1, false),
+            ),
+            NativePointerRoute::Window(OWNER)
+        );
+        assert!(captures.primary_press(DEVICE, OWNER).is_none());
+        assert!(!captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Window(OWNER)
+        );
+
+        // The remaining implicit grab can carry a distinct, genuinely new Primary press.
+        captures.after_button_event(
+            DEVICE,
+            OWNER,
+            true,
+            true,
+            button_state_transition(&[0b0000_1000], 1, true),
+        );
+        let fresh = captures.primary_press_candidate(DEVICE, OWNER).unwrap();
+        captures.complete_primary_press(fresh, NonZeroU64::new(18));
+        let (fresh_domain, fresh_sequence) = captures.primary_press(DEVICE, OWNER).unwrap();
+        assert!(Arc::ptr_eq(&domain, &fresh_domain));
+        assert_ne!(sequence, fresh_sequence);
+        assert!(!captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        assert!(captures.validate_primary_press(DEVICE, OWNER, &fresh_domain, fresh_sequence));
+        assert_eq!(
+            captures.after_button_event(
+                DEVICE,
+                OWNER,
+                true,
+                false,
+                button_state_transition(&[0b0000_1010], 3, false),
+            ),
+            NativePointerRoute::Window(OWNER)
+        );
+        assert!(captures.validate_primary_press(DEVICE, OWNER, &fresh_domain, fresh_sequence));
+        assert_eq!(
+            captures.after_button_event(
+                DEVICE,
+                OWNER,
+                true,
+                false,
+                button_state_transition(&[0b0000_0010], 1, false),
+            ),
+            NativePointerRoute::None
+        );
+    }
+
+    #[test]
+    fn repeated_primary_edges_never_replace_or_retry_window_validation() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let candidate = begin_primary_validation(&mut captures, DEVICE, OWNER);
+        let duplicate = captures.primary_press_candidate(DEVICE, OWNER).unwrap();
+        assert!(captures.primary_press(DEVICE, OWNER).is_none());
+        captures.after_button_event(
+            DEVICE,
+            OWNER,
+            true,
+            true,
+            button_state_transition(&[0b0000_0010], 1, true),
+        );
+        assert!(matches!(
+            captures.owners[&DEVICE].primary.as_ref(),
+            Some(PrimaryPressState::Pending(_))
+        ));
+        captures.complete_primary_press(candidate, NonZeroU64::new(31));
+        let (domain, sequence) = captures.primary_press(DEVICE, OWNER).unwrap();
+        captures.complete_primary_press(duplicate, NonZeroU64::new(32));
+        assert!(captures.primary_press_candidate(DEVICE, OWNER).is_none());
+        assert!(captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        assert_eq!(sequence.get(), 31);
+
+        captures.for_button_state(DEVICE, current_button_state(&[0]));
+        let failed = begin_primary_validation(&mut captures, DEVICE, OWNER);
+        captures.complete_primary_press(failed, None);
+        captures.after_button_event(
+            DEVICE,
+            OWNER,
+            true,
+            true,
+            button_state_transition(&[0b0000_0010], 1, true),
+        );
+        assert!(captures.primary_press_candidate(DEVICE, OWNER).is_none());
+        assert!(captures.primary_press(DEVICE, OWNER).is_none());
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Window(OWNER)
+        );
+    }
+
+    #[test]
+    fn revoked_pending_validation_cannot_bind_a_reused_window_or_device() {
+        for revoke in 0..5 {
+            let mut captures = ImplicitPointerCaptures::default();
+            let predecessor = begin_primary_validation(&mut captures, DEVICE, OWNER);
+            match revoke {
+                0 => captures.invalidate(Some(OWNER)),
+                1 => assert_eq!(captures.reset_window(OWNER), [DEVICE]),
+                2 => assert_eq!(captures.reset_device(DEVICE), Some(OWNER)),
+                3 => captures.remove_device(DEVICE),
+                4 => {
+                    assert_eq!(
+                        captures.for_button_state(DEVICE, None),
+                        NativePointerRoute::Unknown
+                    );
+                },
+                _ => unreachable!(),
+            }
+            if captures.begin_sync(0) {
+                captures.finish_sync(true);
+                captures.queue_drained(0);
+            }
+            captures.for_button_state(DEVICE, current_button_state(&[0]));
+            let successor = begin_primary_validation(&mut captures, DEVICE, OWNER);
+            captures.complete_primary_press(predecessor, NonZeroU64::new(51));
+            assert!(captures.primary_press(DEVICE, OWNER).is_none());
+            captures.complete_primary_press(successor, NonZeroU64::new(52));
+            let (domain, sequence) = captures.primary_press(DEVICE, OWNER).unwrap();
+            assert_eq!(sequence.get(), 52);
+            assert!(captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        }
+    }
+
+    #[test]
+    fn reentrant_mutation_revokes_an_already_validated_primary() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let (domain, sequence) = validated_primary(&mut captures, DEVICE, OWNER, 61);
+        // This is the gap between recording the edge and returning from ModifiersChanged.
+        captures.invalidate(None);
+        assert!(!captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        assert!(captures.primary_press(DEVICE, OWNER).is_none());
+        assert!(captures.begin_sync(0));
+        captures.finish_sync(true);
+        captures.queue_drained(0);
+        assert!(!captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+        assert!(captures.primary_press_candidate(DEVICE, OWNER).is_none());
+    }
+
+    #[test]
+    fn validation_completing_with_a_closed_fence_is_consumed_without_issuing_identity() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let candidate = begin_primary_validation(&mut captures, DEVICE, OWNER);
+        // An unrelated mutation leaves this owner row intact but closes candidate admission.
+        captures.invalidate(Some(OTHER_WINDOW));
+        captures.complete_primary_press(candidate, NonZeroU64::new(71));
+        assert!(captures.begin_sync(0));
+        captures.finish_sync(true);
+        captures.queue_drained(0);
+        assert!(captures.primary_press(DEVICE, OWNER).is_none());
+        assert!(captures.primary_press_candidate(DEVICE, OWNER).is_none());
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Window(OWNER)
+        );
+    }
+
+    #[test]
+    fn connection_domains_and_new_requests_separate_reused_numeric_identifiers() {
+        let mut first_connection = ImplicitPointerCaptures::default();
+        let mut replacement_connection = ImplicitPointerCaptures::default();
+        let (old_domain, old_sequence) =
+            validated_primary(&mut first_connection, DEVICE, OWNER, 81);
+        let (new_domain, new_sequence) =
+            validated_primary(&mut replacement_connection, DEVICE, OWNER, 81);
+        assert_eq!(old_sequence, new_sequence);
+        assert!(!Arc::ptr_eq(&old_domain, &new_domain));
+        assert!(!replacement_connection.validate_primary_press(
+            DEVICE,
+            OWNER,
+            &old_domain,
+            old_sequence
+        ));
+        assert!(replacement_connection.validate_primary_press(
+            DEVICE,
+            OWNER,
+            &new_domain,
+            new_sequence
+        ));
+
+        first_connection.remove_device(DEVICE);
+        let (reused_domain, reused_sequence) =
+            validated_primary(&mut first_connection, DEVICE, OWNER, 82);
+        assert!(Arc::ptr_eq(&old_domain, &reused_domain));
+        assert_ne!(old_sequence, reused_sequence);
+        assert!(!first_connection.validate_primary_press(DEVICE, OWNER, &old_domain, old_sequence));
+        assert!(first_connection.validate_primary_press(
+            DEVICE,
+            OWNER,
+            &reused_domain,
+            reused_sequence
+        ));
+    }
+
+    #[test]
+    fn failed_sync_and_unknown_button_transition_revoke_validated_primary() {
+        for unknown_transition in [false, true] {
+            let mut captures = ImplicitPointerCaptures::default();
+            let (domain, sequence) = validated_primary(&mut captures, DEVICE, OWNER, 91);
+            if unknown_transition {
+                captures.after_button_event(DEVICE, OWNER, true, true, None);
+            } else {
+                captures.invalidate(Some(OTHER_WINDOW));
+                assert!(captures.begin_sync(0));
+                captures.finish_sync(false);
+            }
+            assert!(captures.primary_press(DEVICE, OWNER).is_none());
+            assert!(!captures.validate_primary_press(DEVICE, OWNER, &domain, sequence));
+            assert_eq!(
+                captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+                NativePointerRoute::Unknown
+            );
+        }
     }
 
     #[test]
     fn button_transition_uses_post_event_state() {
         assert_eq!(button_state_transition(&[0], 1, true), transition(false, true));
         assert_eq!(button_state_transition(&[0b0000_0010], 1, false), transition(true, false));
-        assert_eq!(button_state_transition(&[0b0000_1010], 1, false), transition(true, true));
+        assert_eq!(
+            button_state_transition(&[0b0000_1010], 1, false),
+            Some(ButtonStateTransition {
+                any_before: true,
+                any_after: true,
+                primary_before: true,
+                primary_after: false,
+            })
+        );
         assert_eq!(button_state_transition(&[], 1, true), None);
         assert_eq!(button_state_transition(&[0], 0, true), None);
+        assert_eq!(
+            Some(button_state_transition(&[0b0000_1010], 1, false).unwrap().after()),
+            current_button_state(&[0b0000_1000])
+        );
     }
 
     #[test]
@@ -303,7 +810,7 @@ mod tests {
             NativePointerRoute::Window(OWNER)
         );
         assert_eq!(
-            captures.for_button_state(DEVICE, Some(true)),
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
             NativePointerRoute::Window(OWNER)
         );
         assert_eq!(
@@ -324,9 +831,15 @@ mod tests {
     fn capture_without_observed_press_fails_closed_until_buttons_are_up() {
         let mut captures = ImplicitPointerCaptures::default();
 
-        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Unknown
+        );
         assert_eq!(captures.for_button_state(DEVICE, None), NativePointerRoute::Unknown);
-        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0])),
+            NativePointerRoute::None
+        );
     }
 
     #[test]
@@ -340,7 +853,10 @@ mod tests {
         // The native button edge is recorded before ModifiersChanged. Its callback ungrabs;
         // the subsequent MouseInput must read Unknown instead of recording the edge again.
         captures.invalidate(None);
-        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Unknown
+        );
         assert!(captures.begin_sync(0));
         captures.finish_sync(true);
         captures.queue_drained(0);
@@ -348,7 +864,10 @@ mod tests {
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Unknown
         );
-        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0])),
+            NativePointerRoute::None
+        );
         assert_eq!(
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Window(OWNER)
@@ -372,7 +891,10 @@ mod tests {
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Unknown
         );
-        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0])),
+            NativePointerRoute::None
+        );
         captures.finish_sync(true);
 
         // XSync has queued older events, including an all-up followed by another first press.
@@ -381,8 +903,14 @@ mod tests {
             NativePointerRoute::Unknown
         );
         captures.queue_drained(0);
-        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
-        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Unknown
+        );
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0])),
+            NativePointerRoute::None
+        );
         assert_eq!(
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Window(OWNER)
@@ -404,7 +932,7 @@ mod tests {
         captures.after_button_event(DEVICE, OWNER, true, true, transition(true, true));
         captures.invalidate(Some(OWNER));
         assert_eq!(
-            captures.for_button_state(other_device, Some(true)),
+            captures.for_button_state(other_device, current_button_state(&[0b0000_0010])),
             NativePointerRoute::Window(OTHER_WINDOW)
         );
         assert!(captures.begin_sync(0));
@@ -440,7 +968,10 @@ mod tests {
 
         // MapNotify deliberately has no capture transition. Neither a down mask nor a repeated
         // first-press mask on the remapped source restores the old identity.
-        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Unknown
+        );
         assert_eq!(
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Unknown
@@ -462,7 +993,10 @@ mod tests {
         assert!(captures.begin_sync(0));
         captures.finish_sync(true);
         captures.queue_drained(0);
-        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0])),
+            NativePointerRoute::None
+        );
         assert_eq!(
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Window(OWNER)
@@ -495,7 +1029,10 @@ mod tests {
         assert!(state.begin_sync(depth.load(Ordering::Relaxed)));
         state.finish_sync(true);
         state.queue_drained(depth.load(Ordering::Relaxed));
-        assert_eq!(state.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert_eq!(
+            state.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Unknown
+        );
     }
 
     #[test]
@@ -531,7 +1068,10 @@ mod tests {
             assert!(state.begin_sync(depth.load(Ordering::Relaxed)));
             state.finish_sync(true);
             state.queue_drained(depth.load(Ordering::Relaxed));
-            assert_eq!(state.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+            assert_eq!(
+                state.for_button_state(DEVICE, current_button_state(&[0])),
+                NativePointerRoute::None
+            );
             assert_eq!(
                 state.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
                 NativePointerRoute::Window(OWNER)
@@ -622,7 +1162,7 @@ mod tests {
         assert!(captures.begin_sync(0));
         captures.finish_sync(false);
         assert_eq!(
-            captures.for_button_state(other_device, Some(true)),
+            captures.for_button_state(other_device, current_button_state(&[0b0000_0010])),
             NativePointerRoute::Unknown
         );
         captures.queue_drained(0);
@@ -630,7 +1170,10 @@ mod tests {
         assert!(!captures.begin_sync(0));
         captures.finish_sync(true);
         captures.queue_drained(0);
-        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0])),
+            NativePointerRoute::None
+        );
         assert_eq!(
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Unknown
@@ -642,12 +1185,18 @@ mod tests {
         let mut captures = ImplicitPointerCaptures::default();
         captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true));
         assert_eq!(captures.for_button_state(DEVICE, None), NativePointerRoute::Unknown);
-        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Unknown
+        );
         assert_eq!(
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Unknown
         );
-        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.for_button_state(DEVICE, current_button_state(&[0])),
+            NativePointerRoute::None
+        );
         assert_eq!(
             captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
             NativePointerRoute::Window(OWNER)
@@ -658,20 +1207,28 @@ mod tests {
     fn resetting_window_capture_is_scoped_and_idempotent() {
         let mut captures = ImplicitPointerCaptures::default();
         let other_device = DEVICE + 1;
-        captures.owners.insert(DEVICE, ImplicitCaptureOwner::Window(OWNER));
-        captures.owners.insert(other_device, ImplicitCaptureOwner::Window(OTHER_WINDOW));
+        captures
+            .owners
+            .insert(DEVICE, ImplicitPointerCapture::new(ImplicitCaptureOwner::Window(OWNER)));
+        captures.owners.insert(
+            other_device,
+            ImplicitPointerCapture::new(ImplicitCaptureOwner::Window(OTHER_WINDOW)),
+        );
 
         assert_eq!(captures.reset_window(OWNER), vec![DEVICE]);
         assert!(captures.reset_window(OWNER).is_empty());
-        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
         assert_eq!(
-            captures.for_button_state(other_device, Some(true)),
+            captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
+            NativePointerRoute::Unknown
+        );
+        assert_eq!(
+            captures.for_button_state(other_device, current_button_state(&[0b0000_0010])),
             NativePointerRoute::Window(OTHER_WINDOW)
         );
         assert_eq!(captures.reset_device(other_device), Some(OTHER_WINDOW));
         assert_eq!(captures.reset_device(other_device), None);
         assert_eq!(
-            captures.for_button_state(other_device, Some(true)),
+            captures.for_button_state(other_device, current_button_state(&[0b0000_0010])),
             NativePointerRoute::Unknown
         );
         captures.remove_device(other_device);
@@ -710,7 +1267,9 @@ mod tests {
     #[test]
     fn hover_route_does_not_change_capture_owner() {
         let mut captures = ImplicitPointerCaptures::default();
-        captures.owners.insert(DEVICE, ImplicitCaptureOwner::Window(OWNER));
+        captures
+            .owners
+            .insert(DEVICE, ImplicitPointerCapture::new(ImplicitCaptureOwner::Window(OWNER)));
 
         for (first_child, expected) in [
             (0, NativePointerRoute::None),
@@ -725,7 +1284,7 @@ mod tests {
             );
             assert_eq!(hover, expected);
             assert_eq!(
-                captures.for_button_state(DEVICE, Some(true)),
+                captures.for_button_state(DEVICE, current_button_state(&[0b0000_0010])),
                 NativePointerRoute::Window(OWNER)
             );
         }

@@ -34,8 +34,10 @@
 //!
 //! [`EventLoop::run_app(...)`]: crate::event_loop::EventLoop::run_app
 //! [`ControlFlow::WaitUntil`]: crate::event_loop::ControlFlow::WaitUntil
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
-use std::sync::{Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 #[cfg(not(web_platform))]
 use std::time::Instant;
 
@@ -53,6 +55,13 @@ use crate::platform_impl;
 #[cfg(doc)]
 use crate::window::Window;
 use crate::window::{ActivationToken, Theme, WindowId};
+
+#[cfg(x11_platform)]
+use crate::platform_impl::x11::PointerPressConnectionDomain;
+
+#[cfg(not(x11_platform))]
+#[derive(Debug)]
+struct PointerPressConnectionDomain;
 
 /// Describes a generic event.
 ///
@@ -145,6 +154,54 @@ pub enum StartCause {
 
     /// Sent once, immediately after `run` is called. Indicates that the loop was just initialized.
     Init,
+}
+
+/// Opaque identity of an original native Primary mouse-button press.
+///
+/// Equality identifies the same press within the lifetime of its native connection. A token does
+/// not prove that the button remains down, that capture is continuous, or that any window owns
+/// delivery. The native backend must separately validate a retained token before using it.
+///
+/// Currently only X11 produces these identities. Other backends report `None` on mouse input.
+#[derive(Clone)]
+pub struct PointerPressToken {
+    domain: Arc<PointerPressConnectionDomain>,
+    sequence: NonZeroU64,
+}
+
+impl std::fmt::Debug for PointerPressToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PointerPressToken(..)")
+    }
+}
+
+impl PartialEq for PointerPressToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.domain, &other.domain) && self.sequence == other.sequence
+    }
+}
+
+impl Eq for PointerPressToken {}
+
+impl Hash for PointerPressToken {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.domain).hash(state);
+        self.sequence.hash(state);
+    }
+}
+
+#[cfg(x11_platform)]
+impl PointerPressToken {
+    pub(crate) fn from_x11(
+        domain: Arc<PointerPressConnectionDomain>,
+        sequence: NonZeroU64,
+    ) -> Self {
+        Self { domain, sequence }
+    }
+
+    pub(crate) fn x11_identity(&self) -> (&Arc<PointerPressConnectionDomain>, NonZeroU64) {
+        (&self.domain, self.sequence)
+    }
 }
 
 /// Local window geometry frozen when the backend produces a pointer event's physical position.
@@ -393,6 +450,11 @@ pub enum WindowEvent {
         device_id: DeviceId,
         state: ElementState,
         button: MouseButton,
+        /// The original Primary press associated with this edge, when known.
+        ///
+        /// A release may retain the identity it ended, but that identity is already inactive in
+        /// the backend. Other buttons and backends without press identities report `None`.
+        primary_press: Option<PointerPressToken>,
         /// Facts captured from the native event that produced this button edge.
         facts: PointerEventFacts,
     },
@@ -1146,6 +1208,29 @@ mod tests {
     use crate::event;
     use std::collections::{BTreeSet, HashSet};
 
+    #[test]
+    fn primary_press_identity_uses_connection_allocation_and_full_sequence() {
+        let domain = std::sync::Arc::new(super::PointerPressConnectionDomain);
+        let sequence = std::num::NonZeroU64::new(u64::from(u32::MAX) + 5).unwrap();
+        let original = super::PointerPressToken { domain: domain.clone(), sequence };
+        let clone = original.clone();
+        let another_connection = super::PointerPressToken {
+            domain: std::sync::Arc::new(super::PointerPressConnectionDomain),
+            sequence,
+        };
+        let low_bits_only =
+            super::PointerPressToken { domain, sequence: std::num::NonZeroU64::new(4).unwrap() };
+        assert_eq!(original, clone);
+        assert_ne!(original, another_connection);
+        assert_ne!(original, low_bits_only);
+        let mut identities = HashSet::new();
+        assert!(identities.insert(original));
+        assert!(!identities.insert(clone));
+        assert!(identities.insert(another_connection));
+        assert!(identities.insert(low_bits_only));
+        assert_eq!(identities.len(), 3);
+    }
+
     macro_rules! foreach_event {
         ($closure:expr) => {{
             #[allow(unused_mut)]
@@ -1202,6 +1287,7 @@ mod tests {
                     device_id: did,
                     state: event::ElementState::Pressed,
                     button: event::MouseButton::Other(0),
+                    primary_press: None,
                     facts: event::PointerEventFacts::default(),
                 });
                 with_window_event(PinchGesture {

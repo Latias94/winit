@@ -370,6 +370,7 @@ impl ActiveEventLoop {
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
                             event: WindowEvent::MouseInput {
+                                primary_press: None,
                                 device_id,
                                 state,
                                 button,
@@ -424,6 +425,7 @@ impl ActiveEventLoop {
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
                             event: WindowEvent::MouseInput {
+                                primary_press: None,
                                 device_id,
                                 state: ElementState::Pressed,
                                 button,
@@ -508,6 +510,7 @@ impl ActiveEventLoop {
                         Event::WindowEvent {
                             window_id: RootWindowId(id),
                             event: WindowEvent::MouseInput {
+                                primary_press: None,
                                 device_id,
                                 state: ElementState::Released,
                                 button,
