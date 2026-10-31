@@ -5,7 +5,7 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _};
 
 use super::{ActiveEventLoop, WindowId};
 use crate::dpi::PhysicalPosition;
-use crate::event::{DeviceId, PointerEventFacts, PointerWindowRoute};
+use crate::event::{DeviceId, PointerEventFacts, PointerPressToken, PointerWindowRoute};
 use crate::platform::x11::X11PointerObservation;
 
 impl ActiveEventLoop {
@@ -13,6 +13,7 @@ impl ActiveEventLoop {
         &self,
         expected_window: crate::window::WindowId,
         device_id: DeviceId,
+        expected_press: Option<&PointerPressToken>,
     ) -> X11PointerObservation {
         let device = match device_id.0 {
             crate::platform_impl::DeviceId::X(device) => device,
@@ -28,7 +29,11 @@ impl ActiveEventLoop {
         let is_live = |window| {
             windows.get(&WindowId(u64::from(window))).and_then(|window| window.upgrade()).is_some()
         };
-        if !is_live(window) || self.xconn.pointer_observation_blocked() {
+        let press_is_current = || match expected_press {
+            Some(expected) => self.xconn.validate_primary_press(window, device.0, expected),
+            None => true,
+        };
+        if !is_live(window) || self.xconn.pointer_observation_blocked() || !press_is_current() {
             return X11PointerObservation::Unavailable;
         }
         let observation = (|| {
@@ -48,6 +53,13 @@ impl ActiveEventLoop {
             }
             let initial = self.xconn.query_pointer(self.root, device.0).ok()?;
             if !initial.same_screen || initial.root != self.root {
+                return None;
+            }
+            if expected_press.is_some()
+                && !initial.buttons.first().is_some_and(|mask| mask & (1 << 1) != 0)
+            {
+                // Primary-up can reject an expected press. Logical button-down cannot prove
+                // uninterrupted capture, delivery or freedom from a protocol freeze.
                 return None;
             }
             // Point and root child come from this one reply. Walking a mutable foreign hierarchy
@@ -78,7 +90,7 @@ impl ActiveEventLoop {
         })();
         // Replies can read earlier native events into Xlib's queue. Do not publish a sample until
         // those events have been delivered normally; a retry takes a new sample after that drain.
-        if self.xconn.pointer_observation_blocked() {
+        if self.xconn.pointer_observation_blocked() || !press_is_current() {
             X11PointerObservation::Unavailable
         } else {
             observation.unwrap_or(X11PointerObservation::Unavailable)

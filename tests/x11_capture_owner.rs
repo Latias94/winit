@@ -8,10 +8,14 @@ use std::time::{Duration, Instant};
 use rwh_06::{HasWindowHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, PointerPressToken, PointerWindowRoute, WindowEvent};
+use winit::event::{
+    DeviceId, ElementState, MouseButton, PointerPressToken, PointerWindowRoute, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::pump_events::EventLoopExtPumpEvents;
-use winit::platform::x11::{EventLoopBuilderExtX11, WindowAttributesExtX11};
+use winit::platform::x11::{
+    ActiveEventLoopExtX11, EventLoopBuilderExtX11, WindowAttributesExtX11, X11PointerObservation,
+};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 fn inject(arguments: &[&str]) {
@@ -35,6 +39,7 @@ impl Drop for ReleasePrimary {
 #[derive(Default)]
 struct CaptureFixture {
     window: Option<Window>,
+    device: Option<DeviceId>,
     presses: Vec<PointerWindowRoute>,
     primary_presses: Vec<Option<PointerPressToken>>,
     releases: usize,
@@ -42,6 +47,8 @@ struct CaptureFixture {
     release_captures: Vec<PointerWindowRoute>,
     secondary_edges: usize,
     motions: Vec<PointerWindowRoute>,
+    pending_query: Option<(PointerPressToken, bool)>,
+    completed_queries: usize,
 }
 
 impl ApplicationHandler for CaptureFixture {
@@ -72,12 +79,14 @@ impl ApplicationHandler for CaptureFixture {
         assert_eq!(window_id, window.id());
         match event {
             WindowEvent::MouseInput {
+                device_id,
                 button: MouseButton::Left,
                 state: ElementState::Pressed,
                 primary_press,
                 facts,
                 ..
             } => {
+                self.device = Some(device_id);
                 self.presses.push(facts.capture);
                 self.primary_presses.push(primary_press);
                 match self.presses.len() {
@@ -120,6 +129,36 @@ impl ApplicationHandler for CaptureFixture {
             _ => (),
         }
     }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some((expected, active)) = &self.pending_query else {
+            return;
+        };
+        let window = self.window.as_ref().unwrap().id();
+        let device = self.device.unwrap();
+        // Run only after normal FIFO dispatch, never inside a native button callback. An ordinary
+        // successful sample prevents stale-identity checks from passing merely due to a full queue.
+        let ordinary = event_loop.observe_pointer(window, device, None);
+        let X11PointerObservation::Observed { facts, delivery } = ordinary else {
+            assert_eq!(ordinary, X11PointerObservation::Unavailable);
+            return;
+        };
+        assert_eq!(facts.capture, PointerWindowRoute::Unknown);
+        assert_eq!(delivery, PointerWindowRoute::Unknown);
+        let observed = event_loop.observe_pointer(window, device, Some(expected));
+        if *active {
+            let X11PointerObservation::Observed { facts, delivery } = observed else {
+                assert_eq!(observed, X11PointerObservation::Unavailable);
+                return;
+            };
+            assert_eq!(facts.capture, PointerWindowRoute::Unknown);
+            assert_eq!(delivery, PointerWindowRoute::Unknown);
+        } else {
+            assert_eq!(observed, X11PointerObservation::Unavailable);
+        }
+        self.pending_query = None;
+        self.completed_queries += 1;
+    }
 }
 
 fn pump_until(
@@ -136,6 +175,20 @@ fn pump_until(
     // Finish normal FIFO dispatch, including the backend's mutation fence, before
     // injecting the next physical edge. This does not consume or fabricate input.
     event_loop.pump_app_events(Some(Duration::ZERO), fixture);
+}
+
+fn assert_press_query(
+    event_loop: &mut EventLoop<()>,
+    fixture: &mut CaptureFixture,
+    expected: &PointerPressToken,
+    active: bool,
+) {
+    assert!(fixture.pending_query.is_none());
+    let completed = fixture.completed_queries + 1;
+    fixture.pending_query = Some((expected.clone(), active));
+    pump_until(event_loop, fixture, "original Primary identity query", |fixture| {
+        fixture.completed_queries == completed
+    });
 }
 
 #[test]
@@ -166,6 +219,8 @@ fn local_mutations_revoke_queued_and_remapped_capture_owners() {
         "a queued predecessor press cannot restore capture after a local grab mutation"
     );
     assert!(fixture.primary_presses[1].is_none(), "the queued predecessor cannot mint an identity");
+    let original = fixture.primary_presses[0].as_ref().unwrap().clone();
+    assert_press_query(&mut event_loop, &mut fixture, &original, false);
 
     inject(&["mouseup", "1"]);
     pump_until(&mut event_loop, &mut fixture, "all-up after ungrab", |fixture| {
@@ -201,6 +256,9 @@ fn local_mutations_revoke_queued_and_remapped_capture_owners() {
     assert!(fixture.primary_presses[3].is_some(), "the fresh press after remap has an identity");
     assert_ne!(fixture.primary_presses[0], fixture.primary_presses[3]);
     assert_ne!(fixture.primary_presses[2], fixture.primary_presses[3]);
+    let fresh = fixture.primary_presses[3].as_ref().unwrap().clone();
+    assert_press_query(&mut event_loop, &mut fixture, &original, false);
+    assert_press_query(&mut event_loop, &mut fixture, &fresh, true);
     inject(&["mouseup", "1"]);
     pump_until(&mut event_loop, &mut fixture, "final Primary release", |fixture| {
         fixture.releases >= 4
@@ -223,14 +281,17 @@ fn local_mutations_revoke_queued_and_remapped_capture_owners() {
     });
     assert_eq!(fixture.primary_releases[4].as_ref(), Some(&predecessor));
     assert_eq!(fixture.release_captures[4], owner, "Secondary retains the implicit grab");
+    assert_press_query(&mut event_loop, &mut fixture, &predecessor, false);
 
     inject(&["mousedown", "1"]);
     pump_until(&mut event_loop, &mut fixture, "successor Primary with Secondary held", |fixture| {
         fixture.presses.len() >= 6
     });
-    let successor = fixture.primary_presses[5].as_ref().unwrap();
-    assert_ne!(successor, &predecessor, "a new Primary edge has a distinct identity");
+    let successor = fixture.primary_presses[5].as_ref().unwrap().clone();
+    assert_ne!(successor, predecessor, "a new Primary edge has a distinct identity");
     assert_eq!(fixture.presses[5], owner);
+    assert_press_query(&mut event_loop, &mut fixture, &predecessor, false);
+    assert_press_query(&mut event_loop, &mut fixture, &successor, true);
     inject(&["mouseup", "1", "mouseup", "3"]);
     pump_until(&mut event_loop, &mut fixture, "final all-up", |fixture| {
         fixture.releases >= 6 && fixture.secondary_edges >= 2

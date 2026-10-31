@@ -218,10 +218,16 @@ pub trait ActiveEventLoopExtX11 {
     /// This identifies that child's subtree, not an embedded child's deepest hit or delivery.
     /// The expected window's viewability is checked before sampling; it is not an atomic part
     /// of the root-pointer reply and grants no source-window authority.
+    ///
+    /// When `expected_press` is supplied, the exact original Primary press must remain active
+    /// for this connection, window and device before and after sampling. A revoked or replaced
+    /// press returns `Unavailable`. Matching identity does not establish capture or delivery.
+    /// `None` preserves ordinary position/hover observation without a press requirement.
     fn observe_pointer(
         &self,
         expected_window: crate::window::WindowId,
         device_id: crate::event::DeviceId,
+        expected_press: Option<&crate::event::PointerPressToken>,
     ) -> X11PointerObservation;
 }
 
@@ -247,10 +253,11 @@ impl ActiveEventLoopExtX11 for ActiveEventLoop {
         &self,
         expected_window: crate::window::WindowId,
         device_id: crate::event::DeviceId,
+        expected_press: Option<&crate::event::PointerPressToken>,
     ) -> X11PointerObservation {
         match &self.p {
             crate::platform_impl::ActiveEventLoop::X(event_loop) => {
-                event_loop.observe_pointer(expected_window, device_id)
+                event_loop.observe_pointer(expected_window, device_id, expected_press)
             },
             #[cfg(wayland_platform)]
             crate::platform_impl::ActiveEventLoop::Wayland(_) => X11PointerObservation::Unsupported,

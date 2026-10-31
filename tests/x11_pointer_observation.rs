@@ -147,7 +147,8 @@ impl App {
     }
 
     fn pending_query(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
-        let result = event_loop.observe_pointer(self.source_id.unwrap(), self.device.unwrap());
+        let result =
+            event_loop.observe_pointer(self.source_id.unwrap(), self.device.unwrap(), None);
         if result != X11PointerObservation::Unavailable {
             return Err(format!("queued native input must block observation: {result:?}"));
         }
@@ -164,7 +165,7 @@ impl App {
     }
 
     fn sample(&self, event_loop: &ActiveEventLoop, expected: WindowId) -> Result<bool, String> {
-        match event_loop.observe_pointer(expected, self.device.unwrap()) {
+        match event_loop.observe_pointer(expected, self.device.unwrap(), None) {
             X11PointerObservation::Unavailable => Ok(false),
             X11PointerObservation::Unsupported => {
                 Err("live X11 master pointer is unsupported".into())
@@ -272,7 +273,7 @@ impl App {
                 if self.device == Some(dummy) {
                     return Err("dummy DeviceId unexpectedly names the real pointer".into());
                 }
-                let result = event_loop.observe_pointer(self.source_id.unwrap(), dummy);
+                let result = event_loop.observe_pointer(self.source_id.unwrap(), dummy, None);
                 if !matches!(
                     result,
                     X11PointerObservation::Unavailable | X11PointerObservation::Unsupported
@@ -287,7 +288,7 @@ impl App {
                     return Ok(());
                 }
                 let result =
-                    event_loop.observe_pointer(self.source_id.unwrap(), self.device.unwrap());
+                    event_loop.observe_pointer(self.source_id.unwrap(), self.device.unwrap(), None);
                 if result != X11PointerObservation::Unavailable {
                     return Err(format!(
                         "destroyed expected window produced an observation: {result:?}"
@@ -369,7 +370,7 @@ impl ApplicationHandler for App {
                 }
             },
             WindowEvent::MouseInput { device_id, state, button: MouseButton::Left, .. } => {
-                let result = event_loop.observe_pointer(self.source_id.unwrap(), device_id);
+                let result = event_loop.observe_pointer(self.source_id.unwrap(), device_id, None);
                 if result != X11PointerObservation::Unavailable {
                     self.fail(
                         event_loop,
