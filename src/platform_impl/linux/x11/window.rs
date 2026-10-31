@@ -833,8 +833,9 @@ impl UnownedWindow {
         match shared_state.visibility {
             Visibility::No => self
                 .xconn
-                .xcb_connection()
-                .unmap_window(self.xwindow)
+                .with_pointer_capture_mutation(Some(self.xwindow), || {
+                    self.xconn.xcb_connection().unmap_window(self.xwindow)
+                })
                 .expect_then_ignore_error("Failed to unmap window"),
             Visibility::Yes => (),
             Visibility::YesWait => {
@@ -1146,8 +1147,9 @@ impl UnownedWindow {
             shared_state.visibility = Visibility::YesWait;
         } else {
             self.xconn
-                .xcb_connection()
-                .unmap_window(self.xwindow)
+                .with_pointer_capture_mutation(Some(self.xwindow), || {
+                    self.xconn.xcb_connection().unmap_window(self.xwindow)
+                })
                 .expect_then_ignore_error("Failed to call `xcb_unmap_window`");
             self.xconn.flush_requests().expect("Failed to call XUnmapWindow");
             shared_state.visibility = Visibility::No;
@@ -1518,8 +1520,9 @@ impl UnownedWindow {
         // We ungrab before grabbing to prevent passive grabs from causing `AlreadyGrabbed`.
         // Therefore, this is common to both codepaths.
         self.xconn
-            .xcb_connection()
-            .ungrab_pointer(x11rb::CURRENT_TIME)
+            .with_pointer_capture_mutation(None, || {
+                self.xconn.xcb_connection().ungrab_pointer(x11rb::CURRENT_TIME)
+            })
             .expect_then_ignore_error("Failed to call `xcb_ungrab_pointer`");
         *grabbed_lock = CursorGrabMode::None;
 
@@ -1530,28 +1533,29 @@ impl UnownedWindow {
             CursorGrabMode::Confined => {
                 let result = self
                     .xconn
-                    .xcb_connection()
-                    .grab_pointer(
-                        true as _,
-                        self.xwindow,
-                        xproto::EventMask::BUTTON_PRESS
-                            | xproto::EventMask::BUTTON_RELEASE
-                            | xproto::EventMask::ENTER_WINDOW
-                            | xproto::EventMask::LEAVE_WINDOW
-                            | xproto::EventMask::POINTER_MOTION
-                            | xproto::EventMask::POINTER_MOTION_HINT
-                            | xproto::EventMask::BUTTON1_MOTION
-                            | xproto::EventMask::BUTTON2_MOTION
-                            | xproto::EventMask::BUTTON3_MOTION
-                            | xproto::EventMask::BUTTON4_MOTION
-                            | xproto::EventMask::BUTTON5_MOTION
-                            | xproto::EventMask::KEYMAP_STATE,
-                        xproto::GrabMode::ASYNC,
-                        xproto::GrabMode::ASYNC,
-                        self.xwindow,
-                        0u32,
-                        x11rb::CURRENT_TIME,
-                    )
+                    .with_pointer_capture_mutation(None, || {
+                        self.xconn.xcb_connection().grab_pointer(
+                            true as _,
+                            self.xwindow,
+                            xproto::EventMask::BUTTON_PRESS
+                                | xproto::EventMask::BUTTON_RELEASE
+                                | xproto::EventMask::ENTER_WINDOW
+                                | xproto::EventMask::LEAVE_WINDOW
+                                | xproto::EventMask::POINTER_MOTION
+                                | xproto::EventMask::POINTER_MOTION_HINT
+                                | xproto::EventMask::BUTTON1_MOTION
+                                | xproto::EventMask::BUTTON2_MOTION
+                                | xproto::EventMask::BUTTON3_MOTION
+                                | xproto::EventMask::BUTTON4_MOTION
+                                | xproto::EventMask::BUTTON5_MOTION
+                                | xproto::EventMask::KEYMAP_STATE,
+                            xproto::GrabMode::ASYNC,
+                            xproto::GrabMode::ASYNC,
+                            self.xwindow,
+                            0u32,
+                            x11rb::CURRENT_TIME,
+                        )
+                    })
                     .expect("Failed to call `grab_pointer`")
                     .reply()
                     .expect("Failed to receive reply from `grab_pointer`");
@@ -1709,8 +1713,9 @@ impl UnownedWindow {
         // if the cursor isn't currently grabbed
         let mut grabbed_lock = self.cursor_grabbed_mode.lock().unwrap();
         self.xconn
-            .xcb_connection()
-            .ungrab_pointer(x11rb::CURRENT_TIME)
+            .with_pointer_capture_mutation(None, || {
+                self.xconn.xcb_connection().ungrab_pointer(x11rb::CURRENT_TIME)
+            })
             .map_err(|err| {
                 ExternalError::Os(os_error!(OsError::XError(X11Error::from(err).into())))
             })?

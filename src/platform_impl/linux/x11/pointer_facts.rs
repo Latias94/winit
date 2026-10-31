@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 /// Bound hierarchy probing so a malformed or concurrently changing X11 window tree fails closed.
 const MAX_POINTER_HIERARCHY_DEPTH: usize = 64;
@@ -33,9 +35,96 @@ impl ImplicitCaptureOwner {
 #[derive(Debug, Default)]
 pub(super) struct ImplicitPointerCaptures {
     owners: HashMap<u16, ImplicitCaptureOwner>,
+    fence: CaptureMutationFence,
+}
+
+/// Bracket request dispatch without holding either a Display lock or the capture mutex.
+pub(super) struct PointerCaptureMutationGuard<'a> {
+    captures: &'a Mutex<ImplicitPointerCaptures>,
+    native_event_depth: &'a AtomicU32,
+}
+
+impl<'a> PointerCaptureMutationGuard<'a> {
+    pub(super) fn new(
+        captures: &'a Mutex<ImplicitPointerCaptures>,
+        native_event_depth: &'a AtomicU32,
+        window: Option<u32>,
+    ) -> Self {
+        let mut state = captures.lock().unwrap_or_else(|error| error.into_inner());
+        native_event_depth.fetch_add(1, Ordering::Relaxed);
+        state.invalidate(window);
+        Self { captures, native_event_depth }
+    }
+}
+
+impl Drop for PointerCaptureMutationGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.captures.lock().unwrap_or_else(|error| error.into_inner());
+        // A sync started before dispatch may already have returned. Require a new round trip
+        // after dispatch, including when dispatch unwinds, before this depth can reach zero.
+        state.close_fence();
+        self.native_event_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum CaptureMutationFence {
+    #[default]
+    Open,
+    NeedsSync,
+    Syncing,
+    Draining,
+    Failed,
 }
 
 impl ImplicitPointerCaptures {
+    // Keep invalidated devices until an observed all-up state. A later first-press mask alone
+    // must not resurrect the owner of a stream whose continuity was lost.
+    pub(super) fn invalidate(&mut self, window: Option<u32>) {
+        for owner in self.owners.values_mut() {
+            if window.is_none()
+                || window.is_some_and(|window| *owner == ImplicitCaptureOwner::Window(window))
+            {
+                *owner = ImplicitCaptureOwner::Unknown;
+            }
+        }
+        self.close_fence();
+    }
+
+    fn close_fence(&mut self) {
+        if self.fence != CaptureMutationFence::Failed {
+            self.fence = CaptureMutationFence::NeedsSync;
+        }
+    }
+
+    // The caller samples the shared depth while holding the same mutex as mutation begin/Drop.
+    pub(super) fn begin_sync(&mut self, native_event_depth: u32) -> bool {
+        if native_event_depth != 0 || self.fence != CaptureMutationFence::NeedsSync {
+            return false;
+        }
+        self.fence = CaptureMutationFence::Syncing;
+        true
+    }
+
+    pub(super) fn finish_sync(&mut self, succeeded: bool) {
+        if !succeeded {
+            for owner in self.owners.values_mut() {
+                *owner = ImplicitCaptureOwner::Unknown;
+            }
+            self.fence = CaptureMutationFence::Failed;
+        } else if self.fence == CaptureMutationFence::Syncing {
+            // A mutation during XSync changes Syncing back to NeedsSync. Its request must be
+            // covered by another round trip, not by this older completion.
+            self.fence = CaptureMutationFence::Draining;
+        }
+    }
+
+    pub(super) fn queue_drained(&mut self, native_event_depth: u32) {
+        if native_event_depth == 0 && self.fence == CaptureMutationFence::Draining {
+            self.fence = CaptureMutationFence::Open;
+        }
+    }
+
     pub(super) fn after_button_event(
         &mut self,
         device_id: u16,
@@ -55,7 +144,10 @@ impl ImplicitPointerCaptures {
         }
 
         if pressed && !transition.any_before {
-            let owner = if delivery_is_winit {
+            let owner = if delivery_is_winit
+                && self.fence == CaptureMutationFence::Open
+                && !self.owners.contains_key(&device_id)
+            {
                 ImplicitCaptureOwner::Window(delivery_window)
             } else {
                 ImplicitCaptureOwner::Unknown
@@ -77,17 +169,29 @@ impl ImplicitPointerCaptures {
                 self.owners.remove(&device_id);
                 NativePointerRoute::None
             },
-            Some(true) | None => {
+            Some(true) => {
                 self.owners.entry(device_id).or_insert(ImplicitCaptureOwner::Unknown).route()
+            },
+            None => {
+                self.owners.insert(device_id, ImplicitCaptureOwner::Unknown);
+                NativePointerRoute::Unknown
             },
         }
     }
 
     pub(super) fn reset_device(&mut self, device_id: u16) -> Option<u32> {
-        match self.owners.remove(&device_id) {
-            Some(ImplicitCaptureOwner::Window(window)) => Some(window),
-            Some(ImplicitCaptureOwner::Unknown) | None => None,
-        }
+        let owner = self.owners.get_mut(&device_id)?;
+        let window = match *owner {
+            ImplicitCaptureOwner::Window(window) => window,
+            ImplicitCaptureOwner::Unknown => return None,
+        };
+        *owner = ImplicitCaptureOwner::Unknown;
+        self.close_fence();
+        Some(window)
+    }
+
+    pub(super) fn remove_device(&mut self, device_id: u16) {
+        self.owners.remove(&device_id);
     }
 
     pub(super) fn reset_window(&mut self, window: u32) -> Vec<u16> {
@@ -99,8 +203,9 @@ impl ImplicitPointerCaptures {
             })
             .collect::<Vec<_>>();
         for device_id in &devices {
-            self.owners.remove(device_id);
+            self.owners.insert(*device_id, ImplicitCaptureOwner::Unknown);
         }
+        self.close_fence();
         devices
     }
 }
@@ -225,6 +330,331 @@ mod tests {
     }
 
     #[test]
+    fn reentrant_mutation_cannot_remint_the_current_press() {
+        let mut captures = ImplicitPointerCaptures::default();
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Window(OWNER)
+        );
+
+        // The native button edge is recorded before ModifiersChanged. Its callback ungrabs;
+        // the subsequent MouseInput must read Unknown instead of recording the edge again.
+        captures.invalidate(None);
+        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert!(captures.begin_sync(0));
+        captures.finish_sync(true);
+        captures.queue_drained(0);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Unknown
+        );
+        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Window(OWNER)
+        );
+    }
+
+    #[test]
+    fn queued_presses_cannot_bind_before_sync_and_normal_dispatch_drain() {
+        let mut captures = ImplicitPointerCaptures::default();
+        captures.invalidate(None);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Unknown
+        );
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, false, transition(true, false)),
+            NativePointerRoute::None
+        );
+        assert!(captures.begin_sync(0));
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Unknown
+        );
+        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        captures.finish_sync(true);
+
+        // XSync has queued older events, including an all-up followed by another first press.
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Unknown
+        );
+        captures.queue_drained(0);
+        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Window(OWNER)
+        );
+    }
+
+    #[test]
+    fn invalidated_multibutton_stream_needs_the_last_release() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let other_device = DEVICE + 1;
+        captures.after_button_event(
+            other_device,
+            OTHER_WINDOW,
+            true,
+            true,
+            transition(false, true),
+        );
+        captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true));
+        captures.after_button_event(DEVICE, OWNER, true, true, transition(true, true));
+        captures.invalidate(Some(OWNER));
+        assert_eq!(
+            captures.for_button_state(other_device, Some(true)),
+            NativePointerRoute::Window(OTHER_WINDOW)
+        );
+        assert!(captures.begin_sync(0));
+        captures.finish_sync(true);
+        captures.queue_drained(0);
+
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, false, transition(true, true)),
+            NativePointerRoute::Unknown
+        );
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(true, true)),
+            NativePointerRoute::Unknown
+        );
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, false, transition(true, false)),
+            NativePointerRoute::None
+        );
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Window(OWNER)
+        );
+    }
+
+    #[test]
+    fn source_unmap_and_remap_cannot_restore_a_held_capture() {
+        let mut captures = ImplicitPointerCaptures::default();
+        captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true));
+        assert_eq!(captures.reset_window(OWNER), vec![DEVICE]);
+        assert!(captures.begin_sync(0));
+        captures.finish_sync(true);
+        captures.queue_drained(0);
+
+        // MapNotify deliberately has no capture transition. Neither a down mask nor a repeated
+        // first-press mask on the remapped source restores the old identity.
+        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Unknown
+        );
+    }
+
+    #[test]
+    fn mutation_during_sync_requires_another_round_trip() {
+        let mut captures = ImplicitPointerCaptures::default();
+        captures.invalidate(None);
+        assert!(captures.begin_sync(0));
+        captures.invalidate(Some(OWNER));
+        captures.finish_sync(true);
+        captures.queue_drained(0);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Unknown
+        );
+        assert!(captures.begin_sync(0));
+        captures.finish_sync(true);
+        captures.queue_drained(0);
+        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Window(OWNER)
+        );
+    }
+
+    #[test]
+    fn mutation_guard_blocks_sync_until_request_dispatch_returns() {
+        let captures = Mutex::new(ImplicitPointerCaptures::default());
+        let depth = AtomicU32::new(0);
+        let mutation = PointerCaptureMutationGuard::new(&captures, &depth, None);
+        assert_eq!(depth.load(Ordering::Relaxed), 1);
+
+        // Dispatch holds neither mutex. An event-loop poll can acquire the owner but cannot
+        // start a fence round trip while the request has not finished dispatching.
+        {
+            let mut state = captures.try_lock().expect("mutation must release the capture mutex");
+            assert!(!state.begin_sync(depth.load(Ordering::Relaxed)));
+            state.queue_drained(depth.load(Ordering::Relaxed));
+            assert_eq!(state.fence, CaptureMutationFence::NeedsSync);
+            assert_eq!(
+                state.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+                NativePointerRoute::Unknown
+            );
+        }
+
+        drop(mutation);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        let mut state = captures.lock().unwrap();
+        assert!(state.begin_sync(depth.load(Ordering::Relaxed)));
+        state.finish_sync(true);
+        state.queue_drained(depth.load(Ordering::Relaxed));
+        assert_eq!(state.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+    }
+
+    #[test]
+    fn mutation_overlapping_sync_rejects_completion_on_either_side_of_drop() {
+        for complete_before_drop in [true, false] {
+            let captures = Mutex::new(ImplicitPointerCaptures::default());
+            let depth = AtomicU32::new(0);
+            {
+                let mut state = captures.lock().unwrap();
+                state.invalidate(None);
+                assert!(state.begin_sync(depth.load(Ordering::Relaxed)));
+            }
+
+            // The event loop released the mutex to run XSync. Another thread begins sending
+            // a mutation; either XSync or the mutation's dispatch can return first.
+            let mutation = PointerCaptureMutationGuard::new(&captures, &depth, Some(OWNER));
+            assert!(!captures.lock().unwrap().begin_sync(depth.load(Ordering::Relaxed)));
+            if complete_before_drop {
+                captures.lock().unwrap().finish_sync(true);
+                drop(mutation);
+            } else {
+                drop(mutation);
+                captures.lock().unwrap().finish_sync(true);
+            }
+
+            let mut state = captures.lock().unwrap();
+            state.queue_drained(depth.load(Ordering::Relaxed));
+            assert_eq!(state.fence, CaptureMutationFence::NeedsSync);
+            assert_eq!(
+                state.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+                NativePointerRoute::Unknown
+            );
+            assert!(state.begin_sync(depth.load(Ordering::Relaxed)));
+            state.finish_sync(true);
+            state.queue_drained(depth.load(Ordering::Relaxed));
+            assert_eq!(state.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+            assert_eq!(
+                state.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+                NativePointerRoute::Window(OWNER)
+            );
+        }
+    }
+
+    #[test]
+    fn stale_empty_queue_cannot_reopen_across_nested_mutation_or_native_callback() {
+        let captures = Mutex::new(ImplicitPointerCaptures::default());
+        let depth = AtomicU32::new(0);
+        {
+            let mut state = captures.lock().unwrap();
+            state.invalidate(None);
+            assert!(state.begin_sync(depth.load(Ordering::Relaxed)));
+            state.finish_sync(true);
+        }
+
+        // An empty queue has been sampled without the owner mutex. A native callback and
+        // nested mutations intervene before the final locked depth/fence check.
+        depth.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut state = captures.lock().unwrap();
+            state.queue_drained(depth.load(Ordering::Relaxed));
+            assert_eq!(state.fence, CaptureMutationFence::Draining);
+        }
+        let outer = PointerCaptureMutationGuard::new(&captures, &depth, Some(OWNER));
+        let inner = PointerCaptureMutationGuard::new(&captures, &depth, None);
+        assert_eq!(depth.load(Ordering::Relaxed), 3);
+        drop(outer);
+        assert_eq!(depth.load(Ordering::Relaxed), 2);
+        drop(inner);
+        assert_eq!(depth.load(Ordering::Relaxed), 1);
+        {
+            let mut state = captures.lock().unwrap();
+            state.queue_drained(depth.load(Ordering::Relaxed));
+            assert_eq!(state.fence, CaptureMutationFence::NeedsSync);
+            assert!(!state.begin_sync(depth.load(Ordering::Relaxed)));
+        }
+        depth.fetch_sub(1, Ordering::Relaxed);
+        let mut state = captures.lock().unwrap();
+        state.queue_drained(depth.load(Ordering::Relaxed));
+        assert_eq!(state.fence, CaptureMutationFence::NeedsSync);
+        assert!(state.begin_sync(depth.load(Ordering::Relaxed)));
+        state.finish_sync(true);
+        state.queue_drained(depth.load(Ordering::Relaxed));
+        assert_eq!(state.fence, CaptureMutationFence::Open);
+    }
+
+    #[test]
+    fn mutation_dispatch_unwind_closes_fence_before_releasing_depth() {
+        let captures = Mutex::new(ImplicitPointerCaptures::default());
+        let depth = AtomicU32::new(0);
+        let result = std::panic::catch_unwind(|| {
+            let _mutation = PointerCaptureMutationGuard::new(&captures, &depth, None);
+            panic!("request dispatch unwound");
+        });
+        assert!(result.is_err());
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        assert!(!captures.is_poisoned());
+        let mut state = captures.lock().unwrap();
+        state.queue_drained(depth.load(Ordering::Relaxed));
+        assert_eq!(state.fence, CaptureMutationFence::NeedsSync);
+        assert!(state.begin_sync(depth.load(Ordering::Relaxed)));
+        state.finish_sync(false);
+        drop(state);
+
+        // A later guard, including its exit path, must not replace a failed fence with NeedsSync.
+        drop(PointerCaptureMutationGuard::new(&captures, &depth, None));
+        let mut state = captures.lock().unwrap();
+        state.queue_drained(depth.load(Ordering::Relaxed));
+        assert_eq!(state.fence, CaptureMutationFence::Failed);
+        assert!(!state.begin_sync(depth.load(Ordering::Relaxed)));
+    }
+
+    #[test]
+    fn failed_fence_stays_closed_after_drain_all_up_and_later_mutations() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let other_device = DEVICE + 1;
+        captures.after_button_event(
+            other_device,
+            OTHER_WINDOW,
+            true,
+            true,
+            transition(false, true),
+        );
+        captures.invalidate(Some(OWNER));
+        assert!(captures.begin_sync(0));
+        captures.finish_sync(false);
+        assert_eq!(
+            captures.for_button_state(other_device, Some(true)),
+            NativePointerRoute::Unknown
+        );
+        captures.queue_drained(0);
+        captures.invalidate(None);
+        assert!(!captures.begin_sync(0));
+        captures.finish_sync(true);
+        captures.queue_drained(0);
+        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Unknown
+        );
+    }
+
+    #[test]
+    fn missing_button_mask_revokes_identity_until_observed_all_up() {
+        let mut captures = ImplicitPointerCaptures::default();
+        captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true));
+        assert_eq!(captures.for_button_state(DEVICE, None), NativePointerRoute::Unknown);
+        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Unknown
+        );
+        assert_eq!(captures.for_button_state(DEVICE, Some(false)), NativePointerRoute::None);
+        assert_eq!(
+            captures.after_button_event(DEVICE, OWNER, true, true, transition(false, true)),
+            NativePointerRoute::Window(OWNER)
+        );
+    }
+
+    #[test]
     fn resetting_window_capture_is_scoped_and_idempotent() {
         let mut captures = ImplicitPointerCaptures::default();
         let other_device = DEVICE + 1;
@@ -233,12 +663,19 @@ mod tests {
 
         assert_eq!(captures.reset_window(OWNER), vec![DEVICE]);
         assert!(captures.reset_window(OWNER).is_empty());
+        assert_eq!(captures.for_button_state(DEVICE, Some(true)), NativePointerRoute::Unknown);
         assert_eq!(
             captures.for_button_state(other_device, Some(true)),
             NativePointerRoute::Window(OTHER_WINDOW)
         );
         assert_eq!(captures.reset_device(other_device), Some(OTHER_WINDOW));
         assert_eq!(captures.reset_device(other_device), None);
+        assert_eq!(
+            captures.for_button_state(other_device, Some(true)),
+            NativePointerRoute::Unknown
+        );
+        captures.remove_device(other_device);
+        assert!(!captures.owners.contains_key(&other_device));
     }
 
     #[test]
@@ -275,16 +712,23 @@ mod tests {
         let mut captures = ImplicitPointerCaptures::default();
         captures.owners.insert(DEVICE, ImplicitCaptureOwner::Window(OWNER));
 
-        let hover = classify_pointer_hierarchy(
-            OTHER_WINDOW,
-            |window| window == OWNER || window == OTHER_WINDOW,
-            |_| unreachable!(),
-        );
-        assert_eq!(hover, NativePointerRoute::Window(OTHER_WINDOW));
-        assert_eq!(
-            captures.for_button_state(DEVICE, Some(true)),
-            NativePointerRoute::Window(OWNER)
-        );
+        for (first_child, expected) in [
+            (0, NativePointerRoute::None),
+            (OTHER_WINDOW, NativePointerRoute::Window(OTHER_WINDOW)),
+            (300, NativePointerRoute::Foreign),
+            (400, NativePointerRoute::Unknown),
+        ] {
+            let hover = classify_pointer_hierarchy(
+                first_child,
+                |window| window == OWNER || window == OTHER_WINDOW,
+                |window| if window == 400 { Err(()) } else { Ok(0) },
+            );
+            assert_eq!(hover, expected);
+            assert_eq!(
+                captures.for_button_state(DEVICE, Some(true)),
+                NativePointerRoute::Window(OWNER)
+            );
+        }
     }
 
     #[test]

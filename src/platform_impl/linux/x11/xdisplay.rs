@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::{fmt, ptr};
 
 use crate::window::CursorIcon;
@@ -9,6 +9,7 @@ use crate::window::CursorIcon;
 use super::atoms::Atoms;
 use super::ffi;
 use super::monitor::MonitorHandle;
+use super::pointer_facts::{ImplicitPointerCaptures, PointerCaptureMutationGuard};
 use super::work_area::{merge_event_masks, WorkAreaCache};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::randr::ConnectionExt as _;
@@ -51,8 +52,11 @@ pub struct XConnection {
     /// Lazily refreshed exact EWMH/RandR work-area authority.
     pub(super) work_area_cache: Mutex<WorkAreaCache>,
 
-    /// Blocks synchronous observation until every callback from the current native event ends.
+    /// Blocks synchronous observation during native callbacks and capture-mutating dispatch.
     native_event_depth: AtomicU32,
+
+    /// The sole XI2 implicit-capture owner, shared with window mutation paths.
+    pointer_captures: Mutex<ImplicitPointerCaptures>,
 
     /// The resource database.
     database: RwLock<resource_manager::Database>,
@@ -82,6 +86,53 @@ pub type XErrorHandler =
     Option<unsafe extern "C" fn(*mut ffi::Display, *mut ffi::XErrorEvent) -> std::os::raw::c_int>;
 
 impl XConnection {
+    pub(super) fn pointer_captures(&self) -> MutexGuard<'_, ImplicitPointerCaptures> {
+        self.pointer_captures.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(super) fn with_pointer_capture_mutation<R>(
+        &self,
+        window: Option<u32>,
+        dispatch: impl FnOnce() -> R,
+    ) -> R {
+        // A user Display lock across XCB dispatch can deadlock with another sender returning
+        // the shared socket to XCB. Use the existing depth to block sync/drain admission instead.
+        let _mutation = PointerCaptureMutationGuard::new(
+            &self.pointer_captures,
+            &self.native_event_depth,
+            window,
+        );
+        // The guard releases the capture mutex before dispatch and closes the fence again on
+        // exit. Callers only send requests here; replies and flushes remain outside the closure.
+        dispatch()
+    }
+
+    pub(super) fn sync_pointer_capture_mutations(&self) {
+        let needs_sync = {
+            let mut captures = self.pointer_captures();
+            captures.begin_sync(self.native_event_depth.load(Ordering::Relaxed))
+        };
+        if needs_sync {
+            // XSync can invoke user error hooks. Never keep the capture mutex across it.
+            let succeeded =
+                self.sync_with_server().is_ok() && self.xcb_connection().has_error().is_none();
+            self.pointer_captures().finish_sync(succeeded);
+        }
+    }
+
+    pub(super) fn finish_pointer_capture_drain(&self) {
+        // QueuedAlready (0) consumes no events. Keep even this Xlib call outside the capture
+        // mutex: Xlib's lock-entry bookkeeping can itself dispatch requests or invoke hooks.
+        // SAFETY: this is Winit's live, thread-initialized display.
+        let queued = unsafe { (self.xlib.XEventsQueued)(self.display, 0) };
+        if queued == 0 {
+            let mut captures = self.pointer_captures();
+            // Mutation begin/Drop use this same mutex. If they ran after the queue check, their
+            // NeedsSync state cannot be cleared by this older drain result.
+            captures.queue_drained(self.native_event_depth.load(Ordering::Relaxed));
+        }
+    }
+
     pub(super) fn begin_native_event(self: &Arc<Self>) -> NativeEventDispatchGuard {
         self.native_event_depth.fetch_add(1, Ordering::Relaxed);
         NativeEventDispatchGuard(self.clone())
@@ -164,6 +215,7 @@ impl XConnection {
             monitor_handles: Mutex::new(None),
             work_area_cache: Mutex::new(WorkAreaCache::new()),
             native_event_depth: AtomicU32::new(0),
+            pointer_captures: Mutex::new(ImplicitPointerCaptures::default()),
             database: RwLock::new(database),
             cursor_cache: Default::default(),
             randr_version: (randr_version.major_version, randr_version.minor_version),

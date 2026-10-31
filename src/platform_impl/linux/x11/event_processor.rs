@@ -12,7 +12,7 @@ use x11_dl::xinput2::{
 use x11_dl::xlib::{
     self, Display as XDisplay, Window as XWindow, XAnyEvent, XClientMessageEvent, XConfigureEvent,
     XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XMapEvent, XPropertyEvent,
-    XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
+    XReparentEvent, XSelectionEvent, XUnmapEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
 };
 use x11rb::protocol::xkb::ID as XkbId;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, ModMask};
@@ -22,7 +22,7 @@ use xkbcommon_dl::xkb_mod_mask_t;
 
 use super::pointer_facts::{
     button_state_transition, classify_pointer_hierarchy, fp1616_matches_event,
-    ButtonStateTransition, ImplicitPointerCaptures, NativePointerRoute,
+    ButtonStateTransition, NativePointerRoute,
 };
 
 use crate::dpi::{PhysicalPosition, PhysicalSize};
@@ -85,7 +85,9 @@ fn xi_button_state_transition(
 }
 
 fn xi_any_button_pressed(buttons: &xinput2::XIButtonState) -> Option<bool> {
-    xi_button_mask(buttons).map(|mask| mask.iter().any(|byte| *byte != 0))
+    xi_button_mask(buttons)
+        .filter(|mask| !mask.is_empty())
+        .map(|mask| mask.iter().any(|byte| *byte != 0))
 }
 
 pub struct EventProcessor {
@@ -117,8 +119,6 @@ pub struct EventProcessor {
     pub xfiltered_modifiers: VecDeque<u8>,
     pub xmodmap: util::ModifierKeymap,
     pub is_composing: bool,
-    /// XI2 implicit pointer-capture owner per master pointer.
-    pub(super) pointer_captures: RefCell<ImplicitPointerCaptures>,
 }
 
 impl EventProcessor {
@@ -236,8 +236,16 @@ impl EventProcessor {
             xlib::ClientMessage => self.client_message(xev.as_ref(), &mut callback),
             xlib::SelectionNotify => self.selection_notify(xev.as_ref(), &mut callback),
             xlib::ConfigureNotify => self.configure_notify(xev.as_ref(), &mut callback),
-            xlib::ReparentNotify => self.reparent_notify(xev.as_ref()),
+            xlib::ReparentNotify => {
+                let event: &XReparentEvent = xev.as_ref();
+                self.reset_window_pointer_captures(event.window as xproto::Window, &mut callback);
+                self.reparent_notify(event);
+            },
             xlib::MapNotify => self.map_notify(xev.as_ref(), &mut callback),
+            xlib::UnmapNotify => {
+                let event: &XUnmapEvent = xev.as_ref();
+                self.reset_window_pointer_captures(event.window as xproto::Window, &mut callback);
+            },
             xlib::DestroyNotify => self.destroy_notify(xev.as_ref(), &mut callback),
             xlib::PropertyNotify => self.property_notify(xev.as_ref(), &mut callback),
             xlib::VisibilityNotify => self.visibility_notify(xev.as_ref(), &mut callback),
@@ -271,13 +279,18 @@ impl EventProcessor {
                         };
 
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
+                        let transition =
+                            xi_button_state_transition(&xev.buttons, xev.detail, state);
+                        // ModifiersChanged can reenter window mutation APIs. Record this native
+                        // edge first, then only reread the owner after the callback returns.
+                        self.record_button_capture(xev, state, transition);
                         let modifiers = self.update_mods_from_xinput2_event(
                             &xev.mods,
                             &xev.group,
                             false,
                             &mut callback,
                         );
-                        self.xinput2_button_input(xev, state, modifiers, &mut callback);
+                        self.xinput2_button_input(xev, state, transition, modifiers, &mut callback);
                     },
                     xinput2::XI_Motion => {
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
@@ -399,6 +412,7 @@ impl EventProcessor {
 
     pub unsafe fn poll_one_event(&mut self, event_ptr: *mut XEvent) -> bool {
         let window_target = Self::window_target(&self.target);
+        window_target.xconn.sync_pointer_capture_mutations();
         // This function is used to poll and remove a single event
         // from the Xlib event queue in a non-blocking, atomic way.
         // XCheckIfEvent is non-blocking and removes events from queue.
@@ -423,6 +437,11 @@ impl EventProcessor {
             )
         };
 
+        if result == 0 {
+            // Only normal FIFO dispatch may finish the fence. XSync merely queues preceding
+            // events; it must never make their first presses eligible for a new owner.
+            window_target.xconn.finish_pointer_capture_drain();
+        }
         result != 0
     }
 
@@ -531,25 +550,28 @@ impl EventProcessor {
         self.validate_window_route(route)
     }
 
-    fn capture_after_button_event(
+    fn record_button_capture(
         &self,
         event: &XIDeviceEvent,
         state: ElementState,
         transition: Option<ButtonStateTransition>,
-    ) -> PointerWindowRoute {
+    ) {
+        if event.send_event != xlib::False || (event.flags & xinput2::XIPointerEmulated) != 0 {
+            return;
+        }
         let Ok(device_id) = xinput::DeviceId::try_from(event.deviceid) else {
-            return PointerWindowRoute::Unknown;
+            return;
         };
         let delivery_window = event.event as xproto::Window;
         let delivery_is_winit = self.window_exists(delivery_window);
-        let route = self.pointer_captures.borrow_mut().after_button_event(
+        let wt = Self::window_target(&self.target);
+        wt.xconn.pointer_captures().after_button_event(
             device_id,
             delivery_window,
             delivery_is_winit,
             state == ElementState::Pressed,
             transition,
         );
-        self.validate_window_route(route)
     }
 
     fn capture_for_button_state(
@@ -560,7 +582,8 @@ impl EventProcessor {
         let Ok(device_id) = xinput::DeviceId::try_from(device_id) else {
             return PointerWindowRoute::Unknown;
         };
-        let route = self.pointer_captures.borrow_mut().for_button_state(device_id, any_pressed);
+        let wt = Self::window_target(&self.target);
+        let route = wt.xconn.pointer_captures().for_button_state(device_id, any_pressed);
         self.validate_window_route(route)
     }
 
@@ -568,14 +591,16 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
-        let Some(window) = self.pointer_captures.borrow_mut().reset_device(device_id) else {
+        let wt = Self::window_target(&self.target);
+        let window = wt.xconn.pointer_captures().reset_device(device_id);
+        let Some(window) = window else {
             return;
         };
         callback(&self.target, Event::WindowEvent {
             window_id: mkwid(window),
             event: WindowEvent::PointerCaptureChanged {
                 device_id: mkdid(device_id),
-                capture: PointerWindowRoute::None,
+                capture: PointerWindowRoute::Unknown,
             },
         });
     }
@@ -584,13 +609,14 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
-        let device_ids = self.pointer_captures.borrow_mut().reset_window(window);
+        let wt = Self::window_target(&self.target);
+        let device_ids = wt.xconn.pointer_captures().reset_window(window);
         for device_id in device_ids {
             callback(&self.target, Event::WindowEvent {
                 window_id: mkwid(window),
                 event: WindowEvent::PointerCaptureChanged {
                     device_id: mkdid(device_id),
-                    capture: PointerWindowRoute::None,
+                    capture: PointerWindowRoute::Unknown,
                 },
             });
         }
@@ -1284,6 +1310,7 @@ impl EventProcessor {
         &self,
         event: &XIDeviceEvent,
         state: ElementState,
+        transition: Option<ButtonStateTransition>,
         modifiers: Option<ModifiersState>,
         mut callback: F,
     ) where
@@ -1301,7 +1328,6 @@ impl EventProcessor {
             return;
         }
 
-        let transition = xi_button_state_transition(&event.buttons, event.detail, state);
         let hover = self.hover_route(
             event.root,
             event.root_x,
@@ -1310,7 +1336,14 @@ impl EventProcessor {
             event.event as xproto::Window,
             transition.map(|transition| transition.any_before),
         );
-        let capture = self.capture_after_button_event(event, state, transition);
+        let capture = if event.send_event == xlib::False {
+            self.capture_for_button_state(
+                event.deviceid,
+                transition.map(|transition| transition.any_after),
+            )
+        } else {
+            PointerWindowRoute::Unknown
+        };
 
         let facts = PointerEventFacts {
             surface_position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
@@ -1389,7 +1422,11 @@ impl EventProcessor {
             window,
             any_pressed,
         );
-        let capture = self.capture_for_button_state(event.deviceid, any_pressed);
+        let capture = if event.send_event == xlib::False {
+            self.capture_for_button_state(event.deviceid, any_pressed)
+        } else {
+            PointerWindowRoute::Unknown
+        };
         let facts = PointerEventFacts {
             surface_position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
             geometry: None,
@@ -1458,8 +1495,19 @@ impl EventProcessor {
             value = unsafe { value.offset(1) };
         }
 
-        for event in events {
-            callback(&self.target, event);
+        for mut scroll_event in events {
+            // CursorMoved and earlier wheel callbacks can revoke capture. Do not reuse their
+            // cached owner for a later wheel callback from this same native event.
+            if let Event::WindowEvent { event: WindowEvent::MouseWheel { facts, .. }, .. } =
+                &mut scroll_event
+            {
+                facts.capture = if event.send_event == xlib::False {
+                    self.capture_for_button_state(event.deviceid, any_pressed)
+                } else {
+                    PointerWindowRoute::Unknown
+                };
+            }
+            callback(&self.target, scroll_event);
         }
     }
 
@@ -1507,11 +1555,15 @@ impl EventProcessor {
                 window,
                 any_pressed,
             );
-            let capture = self.capture_for_button_state(event.deviceid, any_pressed);
-
-            let event =
+            let entered =
                 Event::WindowEvent { window_id, event: WindowEvent::CursorEntered { device_id } };
-            callback(&self.target, event);
+            callback(&self.target, entered);
+
+            let capture = if event.send_event == xlib::False {
+                self.capture_for_button_state(event.deviceid, any_pressed)
+            } else {
+                PointerWindowRoute::Unknown
+            };
 
             let event = Event::WindowEvent {
                 window_id,
@@ -1871,6 +1923,7 @@ impl EventProcessor {
             } else if 0 != info.flags & (xinput2::XISlaveRemoved | xinput2::XIMasterRemoved) {
                 if let Ok(device_id) = xinput::DeviceId::try_from(info.deviceid) {
                     self.reset_pointer_capture(device_id, &mut callback);
+                    wt.xconn.pointer_captures().remove_device(device_id);
                 }
                 callback(&self.target, Event::DeviceEvent {
                     device_id: mkdid(info.deviceid as xinput::DeviceId),

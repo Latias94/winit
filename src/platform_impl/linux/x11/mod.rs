@@ -335,7 +335,6 @@ impl<T: 'static> EventLoop<T> {
             active_window: None,
             modifiers: Default::default(),
             is_composing: false,
-            pointer_captures: Default::default(),
         };
 
         // Register for device hotplug events
@@ -817,7 +816,11 @@ impl Drop for Window {
         let window = self.deref();
         let xconn = &window.xconn;
 
-        if let Ok(c) = xconn.xcb_connection().destroy_window(window.id().0 as xproto::Window) {
+        let window_id = window.id().0 as xproto::Window;
+        let request = xconn.with_pointer_capture_mutation(Some(window_id), || {
+            xconn.xcb_connection().destroy_window(window_id)
+        });
+        if let Ok(c) = request {
             c.ignore_error();
         }
     }
