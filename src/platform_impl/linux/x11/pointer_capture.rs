@@ -101,9 +101,10 @@ impl ActiveEventLoop {
                     .reply()
                     .ok()?;
                 let pointer = self.xconn.query_pointer(self.root, device.0).ok()?;
+                // Viewable includes mapped ancestors; the actual source grab below
+                // independently checks eligibility after these replies.
                 Some(
                     tree.root == self.root
-                        && tree.parent == self.root
                         && attributes.map_state == xproto::MapState::VIEWABLE
                         && devices.infos.len() == 1
                         && devices.infos[0].deviceid == device.0

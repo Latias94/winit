@@ -108,6 +108,12 @@ impl SharedState {
 unsafe impl Send for UnownedWindow {}
 unsafe impl Sync for UnownedWindow {}
 
+#[derive(Clone, Copy, Default)]
+struct PointerCaptureParent {
+    window: Option<xproto::Window>,
+    history_ready: bool,
+}
+
 pub struct UnownedWindow {
     pub(crate) xconn: Arc<XConnection>, // never changes
     xwindow: xproto::Window,            // never changes
@@ -119,6 +125,7 @@ pub struct UnownedWindow {
     selected_cursor: Mutex<SelectedCursor>,
     // None retains an indeterminate native result until an explicit release succeeds.
     cursor_grabbed_mode: Mutex<Option<CursorGrabMode>>,
+    pointer_capture_parent: Mutex<PointerCaptureParent>,
     #[allow(clippy::mutex_atomic)]
     cursor_visible: Mutex<bool>,
     ime_sender: Mutex<ImeSender>,
@@ -347,6 +354,7 @@ impl UnownedWindow {
             screen_id,
             selected_cursor: Default::default(),
             cursor_grabbed_mode: Mutex::new(Some(CursorGrabMode::None)),
+            pointer_capture_parent: Mutex::new(PointerCaptureParent::default()),
             cursor_visible: Mutex::new(true),
             ime_sender: Mutex::new(event_loop.ime_sender.clone()),
             shared_state: SharedState::new(guessed_monitor, &window_attrs),
@@ -566,6 +574,42 @@ impl UnownedWindow {
         let window = leap!(xconn.sync_with_server().map(|_| window));
 
         Ok(window)
+    }
+
+    pub(super) fn pointer_capture_history_ready(&self) -> bool {
+        self.pointer_capture_parent.lock().unwrap_or_else(|error| error.into_inner()).history_ready
+    }
+
+    pub(super) fn pointer_capture_parent_matches(&self, window: xproto::Window) -> bool {
+        self.pointer_capture_parent.lock().unwrap_or_else(|error| error.into_inner()).window
+            == Some(window)
+    }
+
+    pub(super) fn refresh_pointer_capture_parent(
+        &self,
+        root: xproto::Window,
+        root_structure_events: bool,
+    ) {
+        let parent = self.xconn.with_pointer_capture_mutation(Some(self.xwindow), || {
+            let tree = self.xconn.xcb_connection().query_tree(self.xwindow).ok()?.reply().ok()?;
+            let history_ready = tree.root == root
+                && (tree.parent == root
+                    || (root_structure_events
+                        && self
+                            .xconn
+                            .xcb_connection()
+                            .query_tree(tree.parent)
+                            .ok()?
+                            .reply()
+                            .ok()?
+                            .parent
+                            == root));
+            Some(PointerCaptureParent { window: Some(tree.parent), history_ready })
+        });
+        // Root notifications precede window creation. Reparent refresh closes the existing
+        // mutation fence, so queued presses cannot borrow history from before this install.
+        *self.pointer_capture_parent.lock().unwrap_or_else(|error| error.into_inner()) =
+            parent.unwrap_or_default();
     }
 
     /// Embed this window into a parent window.

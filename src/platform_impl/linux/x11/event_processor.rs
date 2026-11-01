@@ -235,18 +235,51 @@ impl EventProcessor {
         match event_type {
             xlib::ClientMessage => self.client_message(xev.as_ref(), &mut callback),
             xlib::SelectionNotify => self.selection_notify(xev.as_ref(), &mut callback),
-            xlib::ConfigureNotify => self.configure_notify(xev.as_ref(), &mut callback),
+            xlib::ConfigureNotify => {
+                let event: &XConfigureEvent = xev.as_ref();
+                if !self.duplicate_parent_notification(event.event, event.window) {
+                    self.configure_notify(event, &mut callback);
+                }
+            },
             xlib::ReparentNotify => {
                 let event: &XReparentEvent = xev.as_ref();
-                self.reset_window_pointer_captures(event.window as xproto::Window, &mut callback);
-                self.reparent_notify(event);
+                if event.send_event == 0
+                    && !self.duplicate_parent_notification(event.event, event.window)
+                {
+                    let affected = self.reset_window_pointer_captures(
+                        event.window as xproto::Window,
+                        true,
+                        &mut callback,
+                    );
+                    if affected {
+                        self.reparent_notify(event);
+                    }
+                }
             },
-            xlib::MapNotify => self.map_notify(xev.as_ref(), &mut callback),
+            xlib::MapNotify => {
+                let event: &XMapEvent = xev.as_ref();
+                if !self.duplicate_parent_notification(event.event, event.window) {
+                    self.map_notify(event, &mut callback);
+                }
+            },
             xlib::UnmapNotify => {
                 let event: &XUnmapEvent = xev.as_ref();
-                self.reset_window_pointer_captures(event.window as xproto::Window, &mut callback);
+                if event.send_event == 0
+                    && !self.duplicate_parent_notification(event.event, event.window)
+                {
+                    self.reset_window_pointer_captures(
+                        event.window as xproto::Window,
+                        false,
+                        &mut callback,
+                    );
+                }
             },
-            xlib::DestroyNotify => self.destroy_notify(xev.as_ref(), &mut callback),
+            xlib::DestroyNotify => {
+                let event: &XDestroyWindowEvent = xev.as_ref();
+                if !self.duplicate_parent_notification(event.event, event.window) {
+                    self.destroy_notify(event, &mut callback);
+                }
+            },
             xlib::PropertyNotify => self.property_notify(xev.as_ref(), &mut callback),
             xlib::VisibilityNotify => self.visibility_notify(xev.as_ref(), &mut callback),
             xlib::Expose => self.expose(xev.as_ref(), &mut callback),
@@ -466,26 +499,13 @@ impl EventProcessor {
     where
         F: Fn(&Arc<UnownedWindow>) -> Ret,
     {
-        let mut deleted = false;
         let window_id = WindowId(window_id as _);
         let window_target = Self::window_target(&self.target);
-        let result = window_target
-            .windows
-            .borrow()
-            .get(&window_id)
-            .and_then(|window| {
-                let arc = window.upgrade();
-                deleted = arc.is_none();
-                arc
-            })
-            .map(|window| callback(&window));
-
-        if deleted {
-            // Garbage collection
-            window_target.windows.borrow_mut().remove(&window_id);
-        }
-
-        result
+        // A failed upgrade ends live access, not the native lifetime. Keep this exact weak row
+        // until DestroyNotify removes it, even if Map/Configure notifications arrive first.
+        let window =
+            window_target.windows.borrow().get(&window_id).and_then(|window| window.upgrade());
+        window.map(|window| callback(&window))
     }
 
     fn delivery_window_route(&self, window: xproto::Window) -> NativePointerRoute {
@@ -571,6 +591,9 @@ impl EventProcessor {
         };
         let delivery_window = event.event as xproto::Window;
         let delivery_is_winit = self.window_exists(delivery_window);
+        let history_ready = self
+            .with_window(delivery_window, |window| window.pointer_capture_history_ready())
+            .unwrap_or(false);
         let wt = Self::window_target(&self.target);
         let primary_edge = event.detail == xlib::Button1 as c_int;
         // A release carries only historical correlation. Remove its active qualification before
@@ -588,6 +611,7 @@ impl EventProcessor {
                 transition,
             );
             let candidate = (primary_edge
+                && history_ready
                 && state == ElementState::Pressed
                 && transition.is_some_and(|transition| {
                     !transition.primary_before && transition.primary_after
@@ -649,21 +673,62 @@ impl EventProcessor {
         });
     }
 
-    fn reset_window_pointer_captures<T: 'static, F>(&self, window: xproto::Window, mut callback: F)
+    fn duplicate_parent_notification(&self, event: XWindow, window: XWindow) -> bool {
+        // Owned windows already select StructureNotify. Root SubstructureNotify adds a second
+        // copy; only foreign parent notifications need that additional subscription.
+        event != window
+            && Self::window_target(&self.target)
+                .windows
+                .borrow()
+                .contains_key(&WindowId(window as _))
+    }
+
+    fn reset_window_pointer_captures<T: 'static, F>(
+        &self,
+        window: xproto::Window,
+        refresh_parents: bool,
+        mut callback: F,
+    ) -> bool
     where
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
-        let device_ids = wt.xconn.pointer_captures().reset_window(window);
-        for device_id in device_ids {
-            callback(&self.target, Event::WindowEvent {
-                window_id: mkwid(window),
-                event: WindowEvent::PointerCaptureChanged {
-                    device_id: mkdid(device_id),
-                    capture: PointerWindowRoute::Unknown,
-                },
-            });
+        let sources = wt
+            .windows
+            .borrow()
+            .values()
+            .filter_map(|window| window.upgrade())
+            .filter(|source| {
+                source.id() == WindowId(u64::from(window))
+                    || source.pointer_capture_parent_matches(window)
+            })
+            .collect::<Vec<_>>();
+        let mut affected = sources.iter().map(|source| source.id().0 as u32).collect::<Vec<_>>();
+        if wt.windows.borrow().contains_key(&WindowId(u64::from(window))) {
+            affected.push(window);
         }
+        affected.sort_unstable();
+        affected.dedup();
+        let has_sources = !affected.is_empty();
+        for source in affected {
+            let device_ids = wt.xconn.pointer_captures().reset_window(source);
+            for device_id in device_ids {
+                callback(&self.target, Event::WindowEvent {
+                    window_id: mkwid(source),
+                    event: WindowEvent::PointerCaptureChanged {
+                        device_id: mkdid(device_id),
+                        capture: PointerWindowRoute::Unknown,
+                    },
+                });
+            }
+        }
+        if refresh_parents {
+            for source in sources {
+                source.refresh_pointer_capture_parent(wt.root, wt.root_structure_events);
+                source.invalidate_cached_frame_extents();
+            }
+        }
+        has_sources
     }
 
     fn reset_pointer_capture_on_ungrab<T: 'static, F>(&self, event: &XIEnterEvent, callback: F)
@@ -1097,6 +1162,9 @@ impl EventProcessor {
         F: FnMut(&RootAEL, Event<T>),
     {
         let wt = Self::window_target(&self.target);
+        if !self.window_exists(xev.window as xproto::Window) {
+            return;
+        }
         let window = xev.window as xproto::Window;
         if wt.xconn.is_work_area_authority_window(window) && !self.window_exists(window) {
             return;
@@ -1127,13 +1195,14 @@ impl EventProcessor {
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
         let authority_window = wt.xconn.work_area_authority_window_destroyed(window);
-        if authority_window && !self.window_exists(window) {
-            return;
-        }
+        let owned = wt.windows.borrow().contains_key(&WindowId(u64::from(window)));
 
         // Destroying an implicit-grab owner terminates that device stream. Emit the reset before
         // `Destroyed` while the delivery window still has a meaningful identity.
-        self.reset_window_pointer_captures(window, &mut callback);
+        self.reset_window_pointer_captures(window, false, &mut callback);
+        if !owned || (authority_window && !self.window_exists(window)) {
+            return;
+        }
 
         // In the event that the window's been destroyed without being dropped first, we
         // cleanup again here.

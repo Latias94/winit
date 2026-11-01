@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+use x11rb::protocol::xproto::{
+    ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux, MapState, WindowClass,
+};
 use x11rb::rust_connection::RustConnection;
 
 use super::CaptureSampleCheckpoint;
@@ -26,6 +28,7 @@ use crate::platform::x11::{
 use crate::window::{CursorGrabMode, Window, WindowId};
 
 const OPT_IN: &str = "WINIT_X11_POINTER_INTERLEAVING_TEST";
+const MANAGED_OPT_IN: &str = "WINIT_X11_POINTER_ANCESTOR_UNMAP_TEST";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(5);
 
@@ -64,6 +67,9 @@ enum Sample {
     Fresh,
     OrdinaryGrabs,
     Hide(CaptureSampleCheckpoint),
+    AncestorUnmap(CaptureSampleCheckpoint),
+    RevokedWhileHidden,
+    Revoked,
     NativeEntry,
     ForeignInputOnly,
 }
@@ -87,8 +93,63 @@ impl Drop for ForeignInputOnly {
     }
 }
 
+struct ForeignAncestor {
+    connection: RustConnection,
+    source: u32,
+    frame: u32,
+    override_redirect: bool,
+    unmapped: bool,
+}
+
+impl ForeignAncestor {
+    fn remap(&mut self) -> Result<(), x11rb::errors::ReplyError> {
+        if self.unmapped {
+            // A foreign client's MapWindow on the WM frame can be redirected back to the WM.
+            // Bypass that restoration request only, then restore the frame's original flag.
+            // No Winit mutation may invalidate the identity this test is trying to inspect.
+            if !self.override_redirect {
+                self.connection
+                    .change_window_attributes(
+                        self.frame,
+                        &ChangeWindowAttributesAux::new().override_redirect(1),
+                    )?
+                    .check()?;
+            }
+            let mapped = self
+                .connection
+                .map_window(self.frame)
+                .map_err(x11rb::errors::ReplyError::from)
+                .and_then(|request| request.check());
+            let restored = if self.override_redirect {
+                Ok(())
+            } else {
+                self.connection
+                    .change_window_attributes(
+                        self.frame,
+                        &ChangeWindowAttributesAux::new().override_redirect(0),
+                    )
+                    .map_err(x11rb::errors::ReplyError::from)
+                    .and_then(|request| request.check())
+            };
+            mapped?;
+            restored?;
+            self.unmapped = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ForeignAncestor {
+    fn drop(&mut self) {
+        if let Err(error) = self.remap() {
+            eprintln!("foreign ancestor remap cleanup: {error}");
+        }
+    }
+}
+
 #[derive(Default)]
 struct Fixture {
+    managed: bool,
     source: Option<Window>,
     peer: Option<Window>,
     presses: Vec<PrimaryPress>,
@@ -98,6 +159,7 @@ struct Fixture {
     acquisition_was_pending: bool,
     sample: Option<(PrimaryPress, Sample)>,
     release: Option<(PrimaryPress, Release)>,
+    unmapped_ancestor: Option<ForeignAncestor>,
 }
 
 fn assert_observed(
@@ -121,6 +183,57 @@ fn queued_events(inner: &super::ActiveEventLoop) -> i32 {
     unsafe { (inner.xconn.xlib.XPending)(inner.xconn.display) }
 }
 
+fn queued_xi_crossing(inner: &super::ActiveEventLoop) -> bool {
+    struct Probe {
+        extension: i32,
+        found: bool,
+    }
+
+    unsafe extern "C" fn inspect(
+        _display: *mut super::super::ffi::Display,
+        event: *mut super::super::ffi::XEvent,
+        probe: *mut std::os::raw::c_char,
+    ) -> std::os::raw::c_int {
+        // SAFETY: XCheckIfEvent supplies a live event for this call and the caller retains
+        // its stack Probe throughout. Inspect the cookie header only, never its payload.
+        let (event, probe) = unsafe { (&*event, &mut *probe.cast::<Probe>()) };
+        if event.get_type() == super::super::ffi::GenericEvent {
+            // SAFETY: GenericEvent selects this union member.
+            let cookie = unsafe { event.generic_event_cookie };
+            probe.found |= cookie.extension == probe.extension
+                && matches!(
+                    cookie.evtype,
+                    super::super::ffi::XI_Enter | super::super::ffi::XI_Leave
+                );
+        }
+        // An always-false predicate leaves every event and cookie in the original FIFO.
+        0
+    }
+
+    let extension = inner
+        .xconn
+        .xcb_connection()
+        .query_extension(xinput::X11_EXTENSION_NAME.as_bytes())
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert!(extension.present);
+    let mut probe = Probe { extension: i32::from(extension.major_opcode), found: false };
+    let mut ignored = std::mem::MaybeUninit::<super::super::ffi::XEvent>::uninit();
+    // SAFETY: this is the live event-loop-thread display; the callback never selects an event,
+    // dispatches native work or calls Xlib. No uninitialized output is read after this call.
+    let selected = unsafe {
+        (inner.xconn.xlib.XCheckIfEvent)(
+            inner.xconn.display,
+            ignored.as_mut_ptr(),
+            Some(inspect),
+            (&mut probe as *mut Probe).cast(),
+        )
+    };
+    assert_eq!(selected, 0);
+    probe.found
+}
+
 impl ApplicationHandler for Fixture {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.source.is_some() {
@@ -128,8 +241,8 @@ impl ApplicationHandler for Fixture {
         }
         let attributes = Window::default_attributes()
             .with_inner_size(PhysicalSize::new(200_u32, 160_u32))
-            .with_decorations(false)
-            .with_override_redirect(true);
+            .with_decorations(self.managed)
+            .with_override_redirect(!self.managed);
         self.source = Some(
             event_loop
                 .create_window(
@@ -138,7 +251,7 @@ impl ApplicationHandler for Fixture {
                         .with_title("capture sample interleaving source")
                         .with_position(PhysicalPosition::new(32, 64)),
                 )
-                .expect("create the direct-root source"),
+                .expect("create the interleaving source"),
         );
         self.peer = Some(
             event_loop
@@ -147,7 +260,7 @@ impl ApplicationHandler for Fixture {
                         .with_title("capture sample interleaving peer")
                         .with_position(PhysicalPosition::new(312, 64)),
                 )
-                .expect("create the direct-root peer"),
+                .expect("create the interleaving peer"),
         );
     }
 
@@ -231,6 +344,57 @@ impl ApplicationHandler for Fixture {
         let Some((press, sample)) = &self.sample else {
             return;
         };
+        let inner = match &event_loop.p {
+            crate::platform_impl::ActiveEventLoop::X(inner) => inner,
+            #[cfg(wayland_platform)]
+            _ => panic!("the isolated fixture must use X11"),
+        };
+        if *sample == Sample::RevokedWhileHidden {
+            if inner.xconn.pointer_observation_blocked() {
+                return;
+            }
+            let device = match press.device.0 {
+                crate::platform_impl::DeviceId::X(device) => device.0,
+                #[cfg(wayland_platform)]
+                _ => panic!("the press must belong to the X11 master"),
+            };
+            assert!(
+                !inner.xconn.validate_primary_press(
+                    u32::try_from(u64::from(source_id)).unwrap(),
+                    device,
+                    &press.token,
+                ),
+                "ancestor loss must revoke the original identity before any restoration",
+            );
+            assert!(matches!(
+                inner.xconn.pointer_captures().explicit_capture_phase(device),
+                super::super::pointer_facts::ExplicitCapturePhase::Retiring
+                    | super::super::pointer_facts::ExplicitCapturePhase::Revoked
+                    | super::super::pointer_facts::ExplicitCapturePhase::Unacquired
+            ));
+            self.sample = None;
+            return;
+        }
+        if *sample == Sample::Revoked {
+            let ordinary = event_loop.observe_pointer(source_id, press.device, None);
+            if ordinary == X11PointerObservation::Unavailable {
+                return;
+            }
+            // A successful ordinary sample excludes a merely pending queue or hidden source.
+            assert_observed(ordinary, source_id, PointerWindowRoute::Unknown);
+            assert_eq!(
+                event_loop.acquire_pointer_capture(source_id, press.device, &press.token),
+                Acquisition::Unavailable,
+                "ancestor remap must not renew the original acquisition",
+            );
+            assert_eq!(
+                event_loop.observe_pointer(source_id, press.device, Some(&press.token)),
+                X11PointerObservation::Unavailable,
+                "ancestor remap must not restore the original press observation",
+            );
+            self.sample = None;
+            return;
+        }
         if *sample == Sample::Fresh {
             let ordinary = event_loop.observe_pointer(source_id, press.device, None);
             if ordinary == X11PointerObservation::Unavailable {
@@ -245,14 +409,10 @@ impl ApplicationHandler for Fixture {
             self.sample = None;
             return;
         }
-        let inner = match &event_loop.p {
-            crate::platform_impl::ActiveEventLoop::X(inner) => inner,
-            #[cfg(wayland_platform)]
-            _ => panic!("the isolated fixture must use X11"),
-        };
         let mut checkpoints = Vec::new();
         let mut fault_seen = false;
         let mut foreign = None;
+        let mut ancestor = None;
         let observation = inner.observe_pointer_inner(
             source_id,
             press.device,
@@ -281,6 +441,65 @@ impl ApplicationHandler for Fixture {
                                 "Sampling retirement must retain the in-flight native duty",
                             );
                         }
+                        fault_seen = true;
+                    },
+                    (Sample::AncestorUnmap(expected), checkpoint) if expected == checkpoint => {
+                        assert!(self.managed, "only the managed fixture may unmap a WM frame");
+                        let (connection, _) =
+                            x11rb::connect(None).expect("open the independent ancestor client");
+                        let window = u32::try_from(u64::from(source_id)).unwrap();
+                        let tree = connection.query_tree(window).unwrap().reply().unwrap();
+                        assert_eq!(tree.root, inner.root);
+                        assert_ne!(tree.parent, tree.root, "the source must truly be reparented");
+                        let attributes =
+                            connection.get_window_attributes(window).unwrap().reply().unwrap();
+                        assert!(!attributes.override_redirect);
+                        assert_eq!(attributes.map_state, MapState::VIEWABLE);
+                        let mut guard = ForeignAncestor {
+                            override_redirect: connection
+                                .get_window_attributes(tree.parent)
+                                .unwrap()
+                                .reply()
+                                .unwrap()
+                                .override_redirect,
+                            connection,
+                            source: window,
+                            frame: tree.parent,
+                            unmapped: false,
+                        };
+                        // Retain remap cleanup before dispatch, including an indeterminate unmap.
+                        guard.unmapped = true;
+                        guard.connection.unmap_window(guard.frame).unwrap().check().unwrap();
+                        let source_attributes = guard
+                            .connection
+                            .get_window_attributes(guard.source)
+                            .unwrap()
+                            .reply()
+                            .unwrap();
+                        // UNVIEWABLE means the source itself is still mapped; an ancestor is not.
+                        assert_eq!(source_attributes.map_state, MapState::UNVIEWABLE);
+                        assert_eq!(
+                            guard
+                                .connection
+                                .get_window_attributes(guard.frame)
+                                .unwrap()
+                                .reply()
+                                .unwrap()
+                                .map_state,
+                            MapState::UNMAPPED,
+                        );
+                        assert_eq!(
+                            guard
+                                .connection
+                                .query_tree(guard.source)
+                                .unwrap()
+                                .reply()
+                                .unwrap()
+                                .parent,
+                            guard.frame,
+                            "unmapping the frame must not reparent or unmap the source itself",
+                        );
+                        ancestor = Some(guard);
                         fault_seen = true;
                     },
                     (Sample::NativeEntry, CaptureSampleCheckpoint::CaptureRefreshed) => {
@@ -364,17 +583,11 @@ impl ApplicationHandler for Fixture {
                             "the foreign map must actually replace Q1's hover subtree"
                         );
                         assert!(queued_events(inner) > 0, "mapping must queue selected crossing");
-                        let mut next: super::super::ffi::XEvent = unsafe { std::mem::zeroed() };
-                        // SAFETY: XPending established a queued event on this live display.
-                        // XPeekEvent leaves its cookie and FIFO ownership with Winit.
-                        unsafe {
-                            (inner.xconn.xlib.XPeekEvent)(inner.xconn.display, &mut next);
-                            assert_eq!(next.get_type(), super::super::ffi::GenericEvent);
-                            assert!(matches!(
-                                next.generic_event_cookie.evtype,
-                                super::super::ffi::XI_Enter | super::super::ffi::XI_Leave
-                            ));
-                        }
+                        // Root Create/Map notifications can precede the selected crossing.
+                        // Locate its header without consuming or reordering that earlier prefix.
+                        let queued = queued_events(inner);
+                        assert!(queued_xi_crossing(inner));
+                        assert!(queued_events(inner) >= queued);
                         foreign = Some(guard);
                         fault_seen = true;
                     },
@@ -387,7 +600,11 @@ impl ApplicationHandler for Fixture {
             return;
         }
         assert!(fault_seen, "the real sample must reach its requested checkpoint");
-        if *sample == Sample::Hide(CaptureSampleCheckpoint::PositionQueried) {
+        if matches!(
+            sample,
+            Sample::Hide(CaptureSampleCheckpoint::PositionQueried)
+                | Sample::AncestorUnmap(CaptureSampleCheckpoint::PositionQueried)
+        ) {
             // Unmapping before G2 prevents a successful refresh and its checkpoint.
             assert_eq!(checkpoints, [CaptureSampleCheckpoint::PositionQueried]);
         } else {
@@ -396,7 +613,20 @@ impl ApplicationHandler for Fixture {
                 CaptureSampleCheckpoint::CaptureRefreshed
             ]);
         }
-        if *sample == Sample::OrdinaryGrabs {
+        if matches!(sample, Sample::AncestorUnmap(_)) {
+            match observation {
+                X11PointerObservation::Unavailable => (),
+                X11PointerObservation::Observed { facts, delivery } => assert!(
+                    !matches!(
+                        (facts.capture, delivery),
+                        (PointerWindowRoute::Window(_), PointerWindowRoute::Window(_))
+                    ),
+                    "ancestor unmap must reject the sample or withhold capture/delivery: \
+                     {facts:?}, {delivery:?}",
+                ),
+                X11PointerObservation::Unsupported => panic!("the managed source uses X11"),
+            }
+        } else if *sample == Sample::OrdinaryGrabs {
             assert_observed(observation, source_id, PointerWindowRoute::Window(source_id));
         } else {
             assert_eq!(
@@ -417,6 +647,10 @@ impl ApplicationHandler for Fixture {
             assert!(queued_events(inner) > 0, "the outer sample must not drain native events");
         }
         drop(foreign);
+        if let Some(ancestor) = ancestor {
+            assert!(self.unmapped_ancestor.is_none());
+            self.unmapped_ancestor = Some(ancestor);
+        }
         self.sample = None;
     }
 }
@@ -453,6 +687,12 @@ impl ApplicationHandler for Cleanup {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Restore a hidden frame before moving through the ordinary exact-duty cleanup.
+        if let Some(mut ancestor) = self.fixture.unmapped_ancestor.take() {
+            if let Err(error) = ancestor.remap() {
+                eprintln!("capture interleaving ancestor cleanup: {error}");
+            }
+        }
         if let Err(error) = inject(&[
             "mouseup",
             "1",
@@ -600,4 +840,83 @@ fn explicit_capture_sample_rejects_native_interleavings() {
     finish_press(&mut session, &press, Release::Released);
     assert_eq!(session.fixture.presses.len(), 3);
     assert_eq!(session.fixture.releases.len(), 3);
+}
+
+#[test]
+#[ignore = "reparenting X11 WM, XTest, xdotool and WINIT_X11_POINTER_ANCESTOR_UNMAP_TEST=1"]
+fn managed_ancestor_unmap_rejects_capture_samples_at_both_checkpoints() {
+    assert_eq!(
+        std::env::var(MANAGED_OPT_IN).as_deref(),
+        Ok("1"),
+        "set {MANAGED_OPT_IN}=1 only on a dedicated isolated X11 display",
+    );
+    assert!(std::env::var_os("DISPLAY").is_some(), "the isolated DISPLAY is required");
+    let (connection, screen) = x11rb::connect(None).expect("open the WM setup observation client");
+    let root = connection.setup().roots[screen].root;
+    let event_loop = EventLoop::builder().with_x11().with_any_thread(true).build().unwrap();
+    let mut session =
+        Session { fixture: Fixture { managed: true, ..Fixture::default() }, event_loop };
+    pump_until(&mut session, "both managed windows reparented and viewable", |fixture| {
+        let (Some(source), Some(peer)) = (&fixture.source, &fixture.peer) else {
+            return false;
+        };
+        [source, peer].into_iter().all(|window| {
+            let window = u32::try_from(u64::from(window.id())).unwrap();
+            let tree = connection.query_tree(window).unwrap().reply().unwrap();
+            let attributes = connection.get_window_attributes(window).unwrap().reply().unwrap();
+            assert_eq!(tree.root, root);
+            assert!(!attributes.override_redirect);
+            tree.parent != root && attributes.map_state == MapState::VIEWABLE
+        })
+    });
+
+    for checkpoint in
+        [CaptureSampleCheckpoint::PositionQueried, CaptureSampleCheckpoint::CaptureRefreshed]
+    {
+        let source = u64::from(session.fixture.source.as_ref().unwrap().id()).to_string();
+        inject(&["windowactivate", "--sync", &source])
+            .expect("activate the managed source before its real press");
+        flush_polls(&mut session);
+        let press = press_primary(&mut session);
+        sample(&mut session, &press, Sample::AncestorUnmap(checkpoint));
+        // Process the real ungrab/crossing prefix while the ancestor remains unmapped.
+        flush_polls(&mut session);
+        sample(&mut session, &press, Sample::RevokedWhileHidden);
+        let mut ancestor = session
+            .fixture
+            .unmapped_ancestor
+            .take()
+            .expect("the exact checkpoint must retain the unmapped ancestor");
+        assert_eq!(
+            ancestor
+                .connection
+                .get_window_attributes(ancestor.source)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .map_state,
+            MapState::UNVIEWABLE,
+            "the source must remain mapped beneath the unmapped frame through normal pumping",
+        );
+        ancestor.remap().expect("remap only the original WM frame");
+        pump_until(&mut session, "native source viewability after ancestor remap", |_| {
+            ancestor
+                .connection
+                .get_window_attributes(ancestor.source)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .map_state
+                == MapState::VIEWABLE
+        });
+        // Restore hover without releasing Primary or creating a replacement press identity.
+        inject(&["mousemove", "--window", &source, "40", "50", "getmouselocation"])
+            .expect("move into the remapped source with the original Primary still held");
+        flush_polls(&mut session);
+        sample(&mut session, &press, Sample::Revoked);
+        finish_press(&mut session, &press, Release::Unavailable);
+    }
+    assert_eq!(session.fixture.presses.len(), 2);
+    assert_eq!(session.fixture.releases.len(), 2);
+    assert!(session.fixture.unmapped_ancestor.is_none());
 }

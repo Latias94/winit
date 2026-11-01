@@ -236,8 +236,10 @@ pub trait ActiveEventLoopExtX11 {
     /// Acquires unconfined, asynchronous, source-directed capture for one original Primary press.
     ///
     /// Call only after application drag ownership is established. This changes native routing;
-    /// it is not a pointer observation. The finite profile accepts only a viewable direct-root
-    /// source and an enabled exact master pointer. Ordinary window grabs and unresolved cleanup
+    /// it is not a pointer observation. The finite profile accepts a viewable source directly
+    /// below this root or below one root-observed parent, and an enabled exact master pointer.
+    /// Deeper or unobserved source ancestry cannot issue a qualified original press identity.
+    /// Ordinary window grabs and unresolved cleanup
     /// exclude acquisition. One original press permits one attempt; a failed or revoked attempt
     /// cannot be renewed into continuity. Drain normal events while Pending, then poll this same
     /// identity. Acquired does not authorize a stationary action without independent fresh facts.
@@ -266,20 +268,24 @@ pub trait ActiveEventLoopExtX11 {
     /// calls made while a native event is being expanded return `Unavailable`, so callers must
     /// drain and commit their own accepted input before trying again. Capture/delivery cannot
     /// be reconstructed from Winit's retained implicit owner. With the exact `expected_press`
-    /// and an already settled explicit capture, a viewable direct-root source may refresh its
-    /// same-client XI2 grab after the position query. Successful refresh, unchanged exact duty
-    /// and an empty native event queue through the final reply can report both routes as the
-    /// source at that sample. This refresh changes native grab state; it never initially
+    /// and an already settled explicit capture, a source with qualified parent history may refresh
+    /// its same-client XI2 grab after the position query. Successful refresh, unchanged exact
+    /// duty and an empty native event queue through the final reply can report both routes as
+    /// the source at that sample. This refresh changes native grab state; it never initially
     /// acquires capture or proves the older grab was uninterrupted. A refused refresh retains
     /// Unknown routes; an indeterminate refresh retains cleanup without granting authority.
     /// Without that independent proof both routes remain Unknown. X11 local event geometry is
-    /// not supplied
-    /// by this desktop observation. Position describes the server's current logical state.
-    /// Hover names only a direct root child known to this event loop, or no child; a foreign or
-    /// window-manager frame returns Unknown because multiple hierarchy queries are not atomic.
-    /// This identifies that child's subtree, not an embedded child's deepest hit or delivery.
-    /// The expected window's viewability is checked before sampling; it is not an atomic part
-    /// of the root-pointer reply and grants no source-window authority.
+    /// not supplied by this desktop observation. Position describes the server's current logical
+    /// state. Bounded child queries may discover a window-manager hierarchy. Only the terminal
+    /// reply's direct live child and that same reply's root coordinates supply known
+    /// hover/position; earlier replies only identify the next query object. An unknown leaf,
+    /// subtree exit or depth limit keeps hover Unknown, and a failed query makes the sample
+    /// Unavailable. This identifies that child's subtree, not an embedded child's deepest hit
+    /// or delivery. The expected window's viewability is checked before sampling; it is not an
+    /// atomic part of the terminal pointer reply and grants no source-window authority. Native
+    /// parent unmap/reparent/destruction revokes the original identity through root structure
+    /// events; synthetic parent notifications and unrelated root windows cannot revoke that
+    /// owner.
     ///
     /// When `expected_press` is supplied, the exact original Primary press must remain active
     /// for this connection, window and device before and after sampling. A revoked or replaced

@@ -138,6 +138,7 @@ pub struct ActiveEventLoop {
     control_flow: Cell<ControlFlow>,
     exit: Cell<Option<i32>>,
     root: xproto::Window,
+    root_structure_events: bool,
     ime: Option<RefCell<Ime>>,
     windows: RefCell<HashMap<WindowId, Weak<UnownedWindow>>>,
     redraw_sender: WakeSender<WindowId>,
@@ -179,6 +180,8 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
 impl<T: 'static> EventLoop<T> {
     pub(crate) fn new(xconn: Arc<XConnection>) -> EventLoop<T> {
         let root = xconn.default_root().root;
+        let root_structure_events =
+            xconn.select_events_preserving(root, xproto::EventMask::SUBSTRUCTURE_NOTIFY);
         let atoms = xconn.atoms();
 
         let wm_delete_window = atoms[WM_DELETE_WINDOW];
@@ -294,6 +297,7 @@ impl<T: 'static> EventLoop<T> {
         let window_target = ActiveEventLoop {
             ime,
             root,
+            root_structure_events,
             control_flow: Cell::new(ControlFlow::default()),
             exit: Cell::new(None),
             windows: Default::default(),
@@ -809,6 +813,7 @@ impl Window {
     ) -> Result<Self, RootOsError> {
         let window = Arc::new(UnownedWindow::new(event_loop, attribs)?);
         event_loop.windows.borrow_mut().insert(window.id(), Arc::downgrade(&window));
+        window.refresh_pointer_capture_parent(event_loop.root, event_loop.root_structure_events);
         Ok(Window(window))
     }
 }

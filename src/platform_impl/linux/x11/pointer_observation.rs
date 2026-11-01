@@ -10,6 +10,8 @@ use crate::dpi::PhysicalPosition;
 use crate::event::{DeviceId, PointerEventFacts, PointerPressToken, PointerWindowRoute};
 use crate::platform::x11::X11PointerObservation;
 
+const MAX_HOVER_QUERY_DEPTH: usize = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureSampleCheckpoint {
     PositionQueried,
@@ -42,6 +44,39 @@ impl Drop for CaptureSampleDispatch<'_> {
 }
 
 impl ActiveEventLoop {
+    fn query_pointer_hover(
+        &self,
+        device_id: u16,
+        is_live: impl Fn(xproto::Window) -> bool,
+    ) -> Option<(xinput::XIQueryPointerReply, PointerWindowRoute)> {
+        let mut window = self.root;
+        for depth in 0..=MAX_HOVER_QUERY_DEPTH {
+            let observed = self.xconn.query_pointer(window, device_id).ok()?;
+            if !observed.same_screen || observed.root != self.root {
+                return None;
+            }
+            let hover = if observed.child == 0 {
+                if window == self.root {
+                    PointerWindowRoute::None
+                } else {
+                    PointerWindowRoute::Unknown
+                }
+            } else if is_live(observed.child) {
+                PointerWindowRoute::Window(super::mkwid(observed.child))
+            } else if depth == MAX_HOVER_QUERY_DEPTH {
+                PointerWindowRoute::Unknown
+            } else {
+                // Earlier replies discover the next object only. Xorg derives child from
+                // the current sprite's ancestor chain; the terminal reply itself must name
+                // our window, and its own root coordinates supply the position below.
+                window = observed.child;
+                continue;
+            };
+            return Some((observed, hover));
+        }
+        None
+    }
+
     pub(crate) fn observe_pointer(
         &self,
         expected_window: crate::window::WindowId,
@@ -111,12 +146,9 @@ impl ActiveEventLoop {
             {
                 return None;
             }
-            let initial = self.xconn.query_pointer(self.root, device.0).ok()?;
-            if !initial.same_screen || initial.root != self.root {
-                return None;
-            }
+            let (position, hover) = self.query_pointer_hover(device.0, is_live)?;
             if expected_press.is_some()
-                && !initial.buttons.first().is_some_and(|mask| mask & (1 << 1) != 0)
+                && !position.buttons.first().is_some_and(|mask| mask & (1 << 1) != 0)
             {
                 // Primary-up can reject an expected press. Logical button-down cannot prove
                 // uninterrupted capture, delivery or freedom from a protocol freeze.
@@ -125,12 +157,9 @@ impl ActiveEventLoop {
             checkpoint(CaptureSampleCheckpoint::PositionQueried);
             if let Some(sample) = capture_sample.as_mut() {
                 let tree = self.xconn.xcb_connection().query_tree(window).ok()?.reply().ok()?;
-                if tree.root == self.root
-                    && tree.parent == self.root
-                    && self.xconn.xcb_connection().has_error().is_none()
-                {
-                    // G2 checks current ownership/freeze after Q1. Any selected input or crossing
-                    // queued before its reply rejects the entire Q1 sample below, without drain.
+                if tree.root == self.root && self.xconn.xcb_connection().has_error().is_none() {
+                    // G2 checks ownership/freeze after the terminal position query. Selected
+                    // input or crossing queued before its reply rejects that sample without drain.
                     sample.native_result = None;
                     sample.native_result = self
                         .xconn
@@ -159,24 +188,16 @@ impl ActiveEventLoop {
                     }
                 }
             }
-            // Point and root child come from this one reply. Walking a mutable foreign hierarchy
-            // with later replies could assemble a hover route that never existed. A WM frame may
-            // contain a Winit window, so an unrecognized root child is Unknown, never Foreign.
-            let hover = if initial.child == 0 {
-                PointerWindowRoute::None
-            } else if is_live(initial.child) {
-                PointerWindowRoute::Window(super::mkwid(initial.child))
-            } else {
-                PointerWindowRoute::Unknown
-            };
+            // Position and hover belong to the same terminal reply. Unknown foreign leaves
+            // cannot be skipped to infer the Winit client behind a window-manager frame.
             // Query facts alone grant no capture. Only an exact active explicit duty with a fresh
             // successful G2, the final empty native queue and current identity can supply it.
             let fixed = |value| f64::from(value) / 65_536.0;
             Some(X11PointerObservation::Observed {
                 facts: PointerEventFacts {
                     desktop_position: Some(PhysicalPosition::new(
-                        fixed(initial.root_x),
-                        fixed(initial.root_y),
+                        fixed(position.root_x),
+                        fixed(position.root_y),
                     )),
                     hover,
                     ..PointerEventFacts::default()
