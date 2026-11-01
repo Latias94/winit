@@ -10,6 +10,14 @@ use super::{ActiveEventLoop, WindowId, XConnection};
 use crate::event::{DeviceId, PointerPressToken};
 use crate::platform::x11::{X11PointerCaptureAcquisition, X11PointerCaptureRelease};
 
+pub(super) fn explicit_capture_event_mask() -> xinput::XIEventMask {
+    xinput::XIEventMask::BUTTON_PRESS
+        | xinput::XIEventMask::BUTTON_RELEASE
+        | xinput::XIEventMask::MOTION
+        | xinput::XIEventMask::ENTER
+        | xinput::XIEventMask::LEAVE
+}
+
 struct CaptureDispatch<'a> {
     connection: &'a XConnection,
     candidate: Option<ExplicitCaptureCandidate>,
@@ -110,11 +118,7 @@ impl ActiveEventLoop {
             && self.xconn.validate_primary_press(window, device.0, expected_press);
         let result = if eligible && self.xconn.xcb_connection().has_error().is_none() {
             dispatch.result = None;
-            let mask = xinput::XIEventMask::BUTTON_PRESS
-                | xinput::XIEventMask::BUTTON_RELEASE
-                | xinput::XIEventMask::MOTION
-                | xinput::XIEventMask::ENTER
-                | xinput::XIEventMask::LEAVE;
+            let mask = explicit_capture_event_mask();
             // An indeterminate reply retains an exact cleanup duty. Async describes X11 event
             // processing, not a nonblocking Rust request or a continuity proof.
             self.xconn

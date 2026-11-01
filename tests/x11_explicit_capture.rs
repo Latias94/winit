@@ -66,6 +66,12 @@ struct PrimaryPress {
     token: PointerPressToken,
 }
 
+#[derive(Clone, Copy)]
+enum ExpectedCapture {
+    Unknown,
+    WindowSource,
+}
+
 #[derive(Default)]
 struct CaptureFixture {
     source: Option<Window>,
@@ -81,7 +87,7 @@ struct CaptureFixture {
     acquisition_was_pending: bool,
     release: Option<PrimaryPress>,
     release_result: Option<Release>,
-    observation: Option<(PrimaryPress, WindowId)>,
+    observation: Option<(PrimaryPress, WindowId, ExpectedCapture)>,
     observation_complete: bool,
     retired_observation: Option<PrimaryPress>,
 }
@@ -179,17 +185,23 @@ impl ApplicationHandler for CaptureFixture {
                 self.release = None;
             }
         }
-        if let Some((press, hover)) = &self.observation {
+        if let Some((press, hover, expected_capture)) = &self.observation {
+            let expected_capture = match expected_capture {
+                ExpectedCapture::Unknown => PointerWindowRoute::Unknown,
+                ExpectedCapture::WindowSource => PointerWindowRoute::Window(source),
+            };
             // A successful ordinary query prevents a negative check from passing on a full queue.
-            for expected in [None, Some(&press.token)] {
-                match event_loop.observe_pointer(source, press.device, expected) {
+            for (expected_press, expected_route) in
+                [(None, PointerWindowRoute::Unknown), (Some(&press.token), expected_capture)]
+            {
+                match event_loop.observe_pointer(source, press.device, expected_press) {
                     X11PointerObservation::Unavailable => return,
                     X11PointerObservation::Unsupported => {
                         panic!("the real XTest master is supported")
                     },
                     X11PointerObservation::Observed { facts, delivery } => {
-                        assert_eq!(facts.capture, PointerWindowRoute::Unknown);
-                        assert_eq!(delivery, PointerWindowRoute::Unknown);
+                        assert_eq!(facts.capture, expected_route);
+                        assert_eq!(delivery, expected_route);
                         assert_eq!(facts.hover, PointerWindowRoute::Window(*hover));
                     },
                 }
@@ -201,7 +213,9 @@ impl ApplicationHandler for CaptureFixture {
             match event_loop.observe_pointer(source, press.device, None) {
                 X11PointerObservation::Unavailable => return,
                 X11PointerObservation::Unsupported => panic!("the real XTest master is supported"),
-                X11PointerObservation::Observed { .. } => {
+                X11PointerObservation::Observed { facts, delivery } => {
+                    assert_eq!(facts.capture, PointerWindowRoute::Unknown);
+                    assert_eq!(delivery, PointerWindowRoute::Unknown);
                     assert_eq!(
                         event_loop.observe_pointer(source, press.device, Some(&press.token)),
                         X11PointerObservation::Unavailable,
@@ -376,9 +390,14 @@ fn release_status(session: &mut CaptureSession, press: &PrimaryPress, expected: 
     assert_eq!(session.fixture.release_result.as_ref(), Some(&expected));
 }
 
-fn observe_unknown(session: &mut CaptureSession, press: &PrimaryPress, hover: WindowId) {
+fn observe_capture(
+    session: &mut CaptureSession,
+    press: &PrimaryPress,
+    hover: WindowId,
+    expected_capture: ExpectedCapture,
+) {
     session.fixture.observation_complete = false;
-    session.fixture.observation = Some((press.clone(), hover));
+    session.fixture.observation = Some((press.clone(), hover, expected_capture));
     pump_until(session, "fresh ordinary and press-qualified observations", |fixture| {
         fixture.observation_complete
     });
@@ -408,7 +427,7 @@ fn move_over_peer(session: &mut CaptureSession, press: &PrimaryPress, x: i32, y:
         })
     });
     let peer = session.fixture.peer.as_ref().unwrap().id();
-    observe_unknown(session, press, peer);
+    observe_capture(session, press, peer, ExpectedCapture::WindowSource);
 }
 
 struct ForeignKeyboardGrab {
@@ -600,7 +619,7 @@ fn foreign_paired_keyboard_freeze(session: &mut CaptureSession) {
     );
     flush_polls(session);
     acquisition_status(session, &press, Acquisition::Acquired);
-    observe_unknown(session, &press, peer);
+    observe_capture(session, &press, peer, ExpectedCapture::WindowSource);
 
     foreign.freeze();
     inject(&["mouseup", "1", "getmouselocation"])
@@ -608,7 +627,7 @@ fn foreign_paired_keyboard_freeze(session: &mut CaptureSession) {
     flush_polls(session);
     foreign.assert_primary_down();
     acquisition_status(session, &press, Acquisition::Acquired);
-    observe_unknown(session, &press, peer);
+    observe_capture(session, &press, peer, ExpectedCapture::Unknown);
     assert_eq!(session.fixture.primary_releases.len(), releases, "the real release is frozen");
 
     assert_eq!(
@@ -619,7 +638,7 @@ fn foreign_paired_keyboard_freeze(session: &mut CaptureSession) {
     flush_polls(session);
     foreign.assert_primary_down();
     acquisition_status(session, &press, Acquisition::Acquired);
-    observe_unknown(session, &press, peer);
+    observe_capture(session, &press, peer, ExpectedCapture::Unknown);
     assert_eq!(
         session.fixture.primary_releases.len(),
         releases,
@@ -631,7 +650,7 @@ fn foreign_paired_keyboard_freeze(session: &mut CaptureSession) {
         flush_polls(session);
         foreign.assert_primary_down();
         acquisition_status(session, &press, Acquisition::Acquired);
-        observe_unknown(session, &press, peer);
+        observe_capture(session, &press, peer, ExpectedCapture::Unknown);
         assert_eq!(
             session.fixture.primary_releases.len(),
             releases,
@@ -683,11 +702,13 @@ fn explicit_capture_serializes_ordinary_grabs_and_cleans_up_exact_original_press
     let source = session.fixture.source.as_ref().unwrap().id();
 
     let first = press_primary(&mut session);
+    observe_capture(&mut session, &first, source, ExpectedCapture::Unknown);
     acquisition_status(&mut session, &first, Acquisition::Acquired);
     assert!(
         session.fixture.acquisition_was_pending,
         "native acceptance must precede FIFO authority"
     );
+    observe_capture(&mut session, &first, source, ExpectedCapture::WindowSource);
     assert!(
         session.fixture.source.as_ref().unwrap().set_cursor_grab(CursorGrabMode::Confined).is_err(),
         "an active explicit capture must reject ordinary confinement before any ungrab",
@@ -732,7 +753,7 @@ fn explicit_capture_serializes_ordinary_grabs_and_cleans_up_exact_original_press
     session.fixture.source.as_ref().unwrap().set_cursor_grab(CursorGrabMode::Confined).unwrap();
     flush_polls(&mut session);
     let confined = press_primary(&mut session);
-    observe_unknown(&mut session, &confined, source);
+    observe_capture(&mut session, &confined, source, ExpectedCapture::Unknown);
     acquisition_status(&mut session, &confined, Acquisition::Unavailable);
     session.fixture.source.as_ref().unwrap().set_cursor_grab(CursorGrabMode::None).unwrap();
     flush_polls(&mut session);
@@ -742,6 +763,7 @@ fn explicit_capture_serializes_ordinary_grabs_and_cleans_up_exact_original_press
     let automatic = press_primary(&mut session);
     acquisition_status(&mut session, &automatic, Acquisition::Acquired);
     assert!(session.fixture.acquisition_was_pending);
+    observe_capture(&mut session, &automatic, source, ExpectedCapture::WindowSource);
     inject(&["mousedown", "3", "getmouselocation"])
         .expect("hold Secondary during explicit capture");
     pump_until(&mut session, "real Secondary down", |fixture| fixture.secondary_down);

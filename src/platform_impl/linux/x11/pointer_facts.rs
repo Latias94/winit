@@ -88,6 +88,10 @@ impl ExplicitCaptureIdentity {
 #[must_use = "Every reserved acquisition must report its native result, including cancellation."]
 pub(super) struct ExplicitCaptureCandidate(Arc<ExplicitCaptureIdentity>);
 
+#[derive(Debug)]
+#[must_use = "A capture sample must finish its exact native refresh, including cancellation."]
+pub(super) struct ExplicitCaptureSample(Arc<ExplicitCaptureIdentity>);
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExplicitCapturePhase {
@@ -95,6 +99,7 @@ pub(super) enum ExplicitCapturePhase {
     NativeRequest,
     AwaitingFence,
     Active,
+    Sampling,
     Retiring,
     Revoked,
 }
@@ -157,6 +162,7 @@ enum ExplicitCaptureState {
     Unacquired,
     Acquiring { identity: Arc<ExplicitCaptureIdentity>, stage: ExplicitCaptureAcquisition },
     Active(Arc<ExplicitCaptureIdentity>),
+    Sampling { identity: Arc<ExplicitCaptureIdentity>, interval_clear: bool },
     Retiring { identity: Arc<ExplicitCaptureIdentity>, stage: ExplicitCaptureRetirement },
     Revoked,
 }
@@ -219,6 +225,10 @@ impl ImplicitPointerCapture {
                 identity,
                 stage: ExplicitCaptureRetirement::NeedsRelease,
             },
+            ExplicitCaptureState::Sampling { identity, .. } => ExplicitCaptureState::Retiring {
+                identity,
+                stage: ExplicitCaptureRetirement::NativeRequest,
+            },
             retiring @ ExplicitCaptureState::Retiring { .. } => retiring,
             ExplicitCaptureState::Unacquired | ExplicitCaptureState::Revoked => {
                 ExplicitCaptureState::Revoked
@@ -231,6 +241,7 @@ impl ImplicitPointerCapture {
             self.explicit,
             ExplicitCaptureState::Acquiring { .. }
                 | ExplicitCaptureState::Active(_)
+                | ExplicitCaptureState::Sampling { .. }
                 | ExplicitCaptureState::Retiring { .. }
         )
     }
@@ -289,17 +300,19 @@ impl ImplicitPointerCapture {
     fn explicit_capture_awaits_sync(&self) -> bool {
         matches!(
             self.explicit,
-            ExplicitCaptureState::Acquiring {
-                stage: ExplicitCaptureAcquisition::NativeRequest
-                    | ExplicitCaptureAcquisition::AwaitingFence(
-                        ExplicitCaptureFence::NeedsSync | ExplicitCaptureFence::Syncing,
-                    ),
-                ..
-            } | ExplicitCaptureState::Retiring {
-                stage: ExplicitCaptureRetirement::NativeRequest
-                    | ExplicitCaptureRetirement::Releasing(_),
-                ..
-            }
+            ExplicitCaptureState::Sampling { .. }
+                | ExplicitCaptureState::Acquiring {
+                    stage: ExplicitCaptureAcquisition::NativeRequest
+                        | ExplicitCaptureAcquisition::AwaitingFence(
+                            ExplicitCaptureFence::NeedsSync | ExplicitCaptureFence::Syncing,
+                        ),
+                    ..
+                }
+                | ExplicitCaptureState::Retiring {
+                    stage: ExplicitCaptureRetirement::NativeRequest
+                        | ExplicitCaptureRetirement::Releasing(_),
+                    ..
+                }
         )
     }
 
@@ -408,6 +421,16 @@ enum CaptureMutationFence {
 }
 
 impl ImplicitPointerCaptures {
+    /// A nested native expansion invalidates any older in-flight query even
+    /// when its selected events have all been consumed before the final check.
+    pub(super) fn invalidate_capture_sample_intervals(&mut self) {
+        for capture in self.owners.values_mut() {
+            if let ExplicitCaptureState::Sampling { interval_clear, .. } = &mut capture.explicit {
+                *interval_clear = false;
+            }
+        }
+    }
+
     fn end_device_stream(&mut self, device: u16) {
         if let Some(capture) = self.owners.get_mut(&device) {
             capture.replace_owner(ImplicitCaptureOwner::None);
@@ -743,6 +766,7 @@ impl ImplicitPointerCaptures {
                 ..
             } => ExplicitCapturePhase::AwaitingFence,
             ExplicitCaptureState::Active(_) => ExplicitCapturePhase::Active,
+            ExplicitCaptureState::Sampling { .. } => ExplicitCapturePhase::Sampling,
             ExplicitCaptureState::Retiring { .. } => ExplicitCapturePhase::Retiring,
             ExplicitCaptureState::Revoked => ExplicitCapturePhase::Revoked,
         }
@@ -768,6 +792,7 @@ impl ImplicitPointerCaptures {
         };
         if capture.acquisition_available
             || matches!(&capture.explicit, ExplicitCaptureState::Acquiring { identity, .. }
+                | ExplicitCaptureState::Sampling { identity, .. }
                 if identity.matches_press(device, window, domain, press))
         {
             ExplicitCaptureStatus::Pending
@@ -857,7 +882,7 @@ impl ImplicitPointerCaptures {
         ExplicitCaptureCompletion::AwaitingFence
     }
 
-    /// Test fenced authority without changing public pointer-route observations.
+    /// Tests settled effect ownership; fresh route observations still require a sample.
     pub(super) fn has_explicit_capture(
         &self,
         device: u16,
@@ -874,6 +899,75 @@ impl ImplicitPointerCaptures {
         })
     }
 
+    /// Pins the existing active duty across a source-directed native refresh.
+    pub(super) fn begin_explicit_capture_sample(
+        &mut self,
+        device: u16,
+        window: u32,
+        domain: &Arc<PointerPressConnectionDomain>,
+        press: NonZeroU64,
+    ) -> Option<ExplicitCaptureSample> {
+        if self.grab_mutation_in_flight
+            || !self.validate_primary_press(device, window, domain, press)
+        {
+            return None;
+        }
+        let capture = self.owners.get_mut(&device)?;
+        let ExplicitCaptureState::Active(identity) = &capture.explicit else {
+            return None;
+        };
+        if !identity.matches_press(device, window, domain, press) {
+            return None;
+        }
+        let identity = Arc::clone(identity);
+        capture.explicit = ExplicitCaptureState::Sampling {
+            identity: Arc::clone(&identity),
+            interval_clear: true,
+        };
+        Some(ExplicitCaptureSample(identity))
+    }
+
+    /// A refused refresh never releases the original grab. An uncertain result
+    /// retains cleanup; retirement during dispatch cannot restore active proof.
+    /// None rejects the entire query after interval invalidation or uncertainty.
+    pub(super) fn complete_explicit_capture_sample(
+        &mut self,
+        sample: ExplicitCaptureSample,
+        result: Option<bool>,
+    ) -> Option<bool> {
+        let identity = sample.0;
+        let current_press = self.validate_primary_press(
+            identity.device,
+            identity.window,
+            &identity.domain,
+            identity.press,
+        );
+        let capture = self.owners.get_mut(&identity.device)?;
+        let interval_clear = match &capture.explicit {
+            ExplicitCaptureState::Sampling { identity: current, interval_clear }
+                if Arc::ptr_eq(current, &identity) =>
+            {
+                Some(*interval_clear)
+            },
+            _ => None,
+        };
+        let retiring = matches!(&capture.explicit, ExplicitCaptureState::Retiring {
+            identity: current, stage: ExplicitCaptureRetirement::NativeRequest,
+        } if Arc::ptr_eq(current, &identity));
+        if interval_clear.is_none() && !retiring {
+            return None;
+        }
+        if retiring || !current_press || result.is_none() {
+            capture.explicit = ExplicitCaptureState::Retiring {
+                identity,
+                stage: ExplicitCaptureRetirement::NeedsRelease,
+            };
+            return None;
+        }
+        capture.explicit = ExplicitCaptureState::Active(identity);
+        interval_clear.filter(|clear| *clear).and(result)
+    }
+
     /// Retire the exact original lease, even after Primary revocation, and claim known cleanup.
     /// None can mean its native result is still pending or another release already owns the duty.
     pub(super) fn release_explicit_capture(
@@ -887,6 +981,7 @@ impl ImplicitPointerCaptures {
         let identity = match &capture.explicit {
             ExplicitCaptureState::Acquiring { identity, .. }
             | ExplicitCaptureState::Active(identity)
+            | ExplicitCaptureState::Sampling { identity, .. }
             | ExplicitCaptureState::Retiring { identity, .. } => identity,
             ExplicitCaptureState::Unacquired | ExplicitCaptureState::Revoked => return None,
         };
@@ -909,6 +1004,7 @@ impl ImplicitPointerCaptures {
         self.owners.get(&device).is_some_and(|capture| match &capture.explicit {
             ExplicitCaptureState::Acquiring { identity, .. }
             | ExplicitCaptureState::Active(identity)
+            | ExplicitCaptureState::Sampling { identity, .. }
             | ExplicitCaptureState::Retiring { identity, .. } => {
                 identity.matches_press(device, window, domain, press)
             },
@@ -921,6 +1017,7 @@ impl ImplicitPointerCaptures {
             let matches = match &capture.explicit {
                 ExplicitCaptureState::Acquiring { identity, .. }
                 | ExplicitCaptureState::Active(identity)
+                | ExplicitCaptureState::Sampling { identity, .. }
                 | ExplicitCaptureState::Retiring { identity, .. } => identity.window == window,
                 ExplicitCaptureState::Unacquired | ExplicitCaptureState::Revoked => false,
             };
@@ -1215,6 +1312,180 @@ mod tests {
         assert!(!captures.has_explicit_capture(DEVICE, OWNER, &other_domain, press));
         assert!(!captures.has_explicit_capture(DEVICE, OWNER, &domain, other_press));
         assert!(captures.begin_explicit_capture(DEVICE, OWNER, &domain, press).is_none());
+    }
+
+    #[test]
+    fn explicit_capture_sampling_pins_only_the_exact_active_original_duty() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let (domain, press, _) = staged_explicit_capture(&mut captures, 4);
+        let other_domain = Arc::new(PointerPressConnectionDomain);
+        for (device, window, expected_domain, expected_press) in [
+            (DEVICE + 1, OWNER, &domain, press),
+            (DEVICE, OTHER_WINDOW, &domain, press),
+            (DEVICE, OWNER, &other_domain, press),
+            (DEVICE, OWNER, &domain, NonZeroU64::new(102).unwrap()),
+        ] {
+            assert!(captures
+                .begin_explicit_capture_sample(device, window, expected_domain, expected_press)
+                .is_none());
+        }
+        let sample = captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+        assert_eq!(captures.explicit_capture_phase(DEVICE), ExplicitCapturePhase::Sampling);
+        assert!(captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).is_none());
+        assert!(!captures.has_explicit_capture(DEVICE, OWNER, &domain, press));
+        assert!(captures.has_explicit_capture_obligation(DEVICE, OWNER, &domain, press));
+        assert_eq!(captures.complete_explicit_capture_sample(sample, Some(true)), Some(true));
+        assert!(captures.has_explicit_capture(DEVICE, OWNER, &domain, press));
+    }
+
+    #[test]
+    fn refused_capture_sample_keeps_the_original_duty_and_allows_a_fresh_sample() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let (domain, press, _) = staged_explicit_capture(&mut captures, 4);
+        let sample = captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+        assert_eq!(captures.complete_explicit_capture_sample(sample, Some(false)), Some(false));
+        assert!(captures.has_explicit_capture(DEVICE, OWNER, &domain, press));
+        assert!(captures.claim_explicit_capture_releases().is_empty());
+        let fresh = captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+        assert_eq!(captures.complete_explicit_capture_sample(fresh, Some(true)), Some(true));
+        assert!(captures.has_explicit_capture(DEVICE, OWNER, &domain, press));
+    }
+
+    #[test]
+    fn completed_native_expansion_rejects_the_old_sample_even_after_queue_drain() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let (domain, press, _) = staged_explicit_capture(&mut captures, 4);
+        let sample = captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+        // Production native-entry guards mark the existing row before expansion.
+        // Returning to depth zero and an empty queue cannot erase this history.
+        captures.invalidate_capture_sample_intervals();
+        captures.queue_drained(0);
+        assert!(captures.validate_primary_press(DEVICE, OWNER, &domain, press));
+        assert_eq!(captures.complete_explicit_capture_sample(sample, Some(true)), None);
+        assert!(captures.has_explicit_capture(DEVICE, OWNER, &domain, press));
+        let fresh = captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+        assert_eq!(captures.complete_explicit_capture_sample(fresh, Some(true)), Some(true));
+    }
+
+    #[test]
+    fn capture_sample_retirement_waits_for_the_native_result_and_never_restores_authority() {
+        for retirement in 0..5 {
+            for result in [Some(true), Some(false), None] {
+                let mut captures = ImplicitPointerCaptures::default();
+                let (domain, press, _) = staged_explicit_capture(&mut captures, 4);
+                let sample =
+                    captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+                match retirement {
+                    0 => captures.invalidate(Some(OWNER)),
+                    1 => {
+                        captures.for_button_state(DEVICE, current_button_state(&[0b1000]));
+                    },
+                    2 => captures.remove_device(DEVICE),
+                    3 => {
+                        captures.reset_window(OWNER);
+                    },
+                    4 => assert!(captures
+                        .release_explicit_capture(DEVICE, OWNER, &domain, press)
+                        .is_none()),
+                    _ => unreachable!(),
+                }
+                assert!(captures.claim_explicit_capture_releases().is_empty());
+                captures.queue_drained(0);
+                assert!(!captures.has_explicit_capture(DEVICE, OWNER, &domain, press));
+                assert_eq!(captures.complete_explicit_capture_sample(sample, result), None);
+                assert_eq!(captures.explicit_capture_phase(DEVICE), ExplicitCapturePhase::Retiring);
+                let [release]: [_; 1] = captures
+                    .claim_explicit_capture_releases()
+                    .try_into()
+                    .expect("normal polling must automatically claim the retired duty");
+                assert!(captures.claim_explicit_capture_releases().is_empty());
+                assert!(captures.begin_explicit_capture_release(&release));
+                assert!(captures.complete_explicit_capture_release(release, true));
+                assert!(!captures.has_explicit_capture_obligation(DEVICE, OWNER, &domain, press));
+            }
+        }
+    }
+
+    #[test]
+    fn indeterminate_capture_sample_retains_cleanup_without_new_acquisition() {
+        let mut captures = ImplicitPointerCaptures::default();
+        let (domain, press, _) = staged_explicit_capture(&mut captures, 4);
+        let sample = captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+        assert_eq!(captures.complete_explicit_capture_sample(sample, None), None);
+        assert_eq!(captures.explicit_capture_phase(DEVICE), ExplicitCapturePhase::Retiring);
+        assert!(captures.begin_explicit_capture(DEVICE, OWNER, &domain, press).is_none());
+        let release = captures.release_explicit_capture(DEVICE, OWNER, &domain, press).unwrap();
+        assert!(captures.begin_explicit_capture_release(&release));
+        assert!(captures.complete_explicit_capture_release(release, true));
+        assert!(!captures.has_explicit_capture_obligation(DEVICE, OWNER, &domain, press));
+    }
+
+    #[test]
+    fn late_capture_sample_cannot_authorize_a_successor_primary_or_erase_old_cleanup() {
+        for result in [Some(true), Some(false), None] {
+            let mut captures = ImplicitPointerCaptures::default();
+            let (domain, press, _) = staged_explicit_capture(&mut captures, 4);
+            let sample =
+                captures.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+            captures.remove_device(DEVICE);
+            captures.for_button_state(DEVICE, current_button_state(&[0]));
+            let (next_domain, next_press) =
+                validated_primary(&mut captures, DEVICE, OTHER_WINDOW, 202);
+            assert!(captures
+                .begin_explicit_capture(DEVICE, OTHER_WINDOW, &next_domain, next_press)
+                .is_none());
+            assert_eq!(captures.complete_explicit_capture_sample(sample, result), None);
+            assert!(captures.has_explicit_capture_obligation(DEVICE, OWNER, &domain, press));
+            assert!(!captures.has_explicit_capture(DEVICE, OTHER_WINDOW, &next_domain, next_press));
+            let release = captures.release_explicit_capture(DEVICE, OWNER, &domain, press).unwrap();
+            let late = ExplicitCaptureRelease {
+                identity: Arc::clone(&release.identity),
+                claim: Arc::clone(&release.claim),
+            };
+            assert!(captures.begin_explicit_capture_release(&release));
+            assert!(!captures.complete_explicit_capture_release(release, false));
+            let retry = captures.release_explicit_capture(DEVICE, OWNER, &domain, press).unwrap();
+            assert!(!captures.begin_explicit_capture_release(&late));
+            assert!(!captures.complete_explicit_capture_release(late, true));
+            assert!(captures.begin_explicit_capture_release(&retry));
+            assert!(captures.complete_explicit_capture_release(retry, true));
+            assert!(!captures.validate_primary_press(
+                DEVICE,
+                OTHER_WINDOW,
+                &next_domain,
+                next_press
+            ));
+            assert!(captures.release_explicit_capture(DEVICE, OWNER, &domain, press).is_none());
+        }
+    }
+
+    #[test]
+    fn capture_sampling_blocks_ordinary_takeover_through_exact_cleanup() {
+        let mut state = ImplicitPointerCaptures::default();
+        let (domain, press, _) = staged_explicit_capture(&mut state, 4);
+        let sample = state.begin_explicit_capture_sample(DEVICE, OWNER, &domain, press).unwrap();
+        let captures = Mutex::new(state);
+        let depth = AtomicU32::new(0);
+        assert!(PointerGrabMutationGuard::try_new(&captures, &depth).is_none());
+        assert!(captures
+            .lock()
+            .unwrap()
+            .release_explicit_capture(DEVICE, OWNER, &domain, press)
+            .is_none());
+        assert!(PointerGrabMutationGuard::try_new(&captures, &depth).is_none());
+        assert_eq!(
+            captures.lock().unwrap().complete_explicit_capture_sample(sample, Some(true)),
+            None
+        );
+        assert!(PointerGrabMutationGuard::try_new(&captures, &depth).is_none());
+        let release = captures
+            .lock()
+            .unwrap()
+            .release_explicit_capture(DEVICE, OWNER, &domain, press)
+            .unwrap();
+        assert!(captures.lock().unwrap().begin_explicit_capture_release(&release));
+        assert!(captures.lock().unwrap().complete_explicit_capture_release(release, true));
+        assert!(PointerGrabMutationGuard::try_new(&captures, &depth).is_some());
     }
 
     #[test]

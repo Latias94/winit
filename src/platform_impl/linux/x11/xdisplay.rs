@@ -203,7 +203,9 @@ impl XConnection {
     }
 
     pub(super) fn begin_native_event(self: &Arc<Self>) -> NativeEventDispatchGuard {
+        let mut captures = self.pointer_captures();
         self.native_event_depth.fetch_add(1, Ordering::Relaxed);
+        captures.invalidate_capture_sample_intervals();
         NativeEventDispatchGuard(self.clone())
     }
 

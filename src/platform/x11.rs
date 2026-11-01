@@ -10,14 +10,15 @@ use crate::dpi::{PhysicalPosition, PhysicalSize, Size};
 
 /// One fresh, synchronous observation of an exact X11 pointer.
 ///
-/// This never creates a motion event, changes a grab, or consumes pending native events.
+/// This never creates a motion event or consumes pending native events. Sampling an exact
+/// already acquired explicit capture may refresh that same source-directed XI2 grab.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum X11PointerObservation {
     /// Facts sampled after the preceding native event has been fully dispatched.
     Observed {
-        /// Pointer facts independent of the requested window identity.
+        /// Queried pointer facts, with capture only when independently refreshed.
         facts: crate::event::PointerEventFacts,
-        /// Native delivery, currently unknown because XIQueryPointer does not report grabs.
+        /// Native delivery from independently refreshed explicit capture, otherwise Unknown.
         delivery: crate::event::PointerWindowRoute,
     },
     /// Native events, window/device changes, or an incomplete query prevent an ordered sample.
@@ -264,10 +265,15 @@ pub trait ActiveEventLoopExtX11 {
     /// `expected_window` must still identify the live source window. Pending native events and
     /// calls made while a native event is being expanded return `Unavailable`, so callers must
     /// drain and commit their own accepted input before trying again. Capture/delivery cannot
-    /// be reconstructed from Winit's retained implicit owner: XIQueryPointer reports neither
-    /// the current grab nor a protocol freeze. Both capture and delivery are currently unknown.
-    /// This observation therefore cannot authorize a stationary captured gesture. An unknown
-    /// route is never inferred from `expected_window`. X11 local event geometry is not supplied
+    /// be reconstructed from Winit's retained implicit owner. With the exact `expected_press`
+    /// and an already settled explicit capture, a viewable direct-root source may refresh its
+    /// same-client XI2 grab after the position query. Successful refresh, unchanged exact duty
+    /// and an empty native event queue through the final reply can report both routes as the
+    /// source at that sample. This refresh changes native grab state; it never initially
+    /// acquires capture or proves the older grab was uninterrupted. A refused refresh retains
+    /// Unknown routes; an indeterminate refresh retains cleanup without granting authority.
+    /// Without that independent proof both routes remain Unknown. X11 local event geometry is
+    /// not supplied
     /// by this desktop observation. Position describes the server's current logical state.
     /// Hover names only a direct root child known to this event loop, or no child; a foreign or
     /// window-manager frame returns Unknown because multiple hierarchy queries are not atomic.
@@ -277,7 +283,10 @@ pub trait ActiveEventLoopExtX11 {
     ///
     /// When `expected_press` is supplied, the exact original Primary press must remain active
     /// for this connection, window and device before and after sampling. A revoked or replaced
-    /// press returns `Unavailable`. Matching identity does not establish capture or delivery.
+    /// press returns `Unavailable`. Matching identity alone does not establish capture or delivery.
+    /// Events encountered during the query reject its entire sample, rather than being drained
+    /// and combined with older facts. Logical buttons do not prove physical input state, and
+    /// a successful sample does not guarantee the absence of later protocol freezes.
     /// `None` preserves ordinary position/hover observation without a press requirement.
     fn observe_pointer(
         &self,
