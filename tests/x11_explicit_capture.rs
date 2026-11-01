@@ -5,7 +5,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rwh_06::{HasWindowHandle, RawWindowHandle};
+use rwh_06::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{
@@ -19,6 +19,10 @@ use winit::platform::x11::{
     X11PointerObservation,
 };
 use winit::window::{CursorGrabMode, Window, WindowId};
+use x11rb::protocol::xinput::{self, ConnectionExt as _};
+use x11rb::protocol::xproto::{self, ConnectionExt as _};
+use x11rb::rust_connection::RustConnection;
+use x11rb::xcb_ffi::XCBConnection;
 
 const OPT_IN: &str = "WINIT_X11_EXPLICIT_CAPTURE_TEST";
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,6 +83,7 @@ struct CaptureFixture {
     release_result: Option<Release>,
     observation: Option<(PrimaryPress, WindowId)>,
     observation_complete: bool,
+    retired_observation: Option<PrimaryPress>,
 }
 
 impl ApplicationHandler for CaptureFixture {
@@ -191,6 +196,20 @@ impl ApplicationHandler for CaptureFixture {
             }
             self.observation_complete = true;
             self.observation = None;
+        }
+        if let Some(press) = &self.retired_observation {
+            match event_loop.observe_pointer(source, press.device, None) {
+                X11PointerObservation::Unavailable => return,
+                X11PointerObservation::Unsupported => panic!("the real XTest master is supported"),
+                X11PointerObservation::Observed { .. } => {
+                    assert_eq!(
+                        event_loop.observe_pointer(source, press.device, Some(&press.token)),
+                        X11PointerObservation::Unavailable,
+                        "the delivered real release must retire the original press observation",
+                    );
+                },
+            }
+            self.retired_observation = None;
         }
     }
 }
@@ -382,6 +401,189 @@ fn move_over_peer(session: &mut CaptureSession, press: &PrimaryPress, x: i32, y:
     observe_unknown(session, press, peer);
 }
 
+struct ForeignKeyboardGrab {
+    connection: RustConnection,
+    root: u32,
+    pointer: u16,
+    keyboard: u16,
+    active: bool,
+}
+
+impl ForeignKeyboardGrab {
+    fn acquire(window: &Window) -> Self {
+        let (connection, _) = x11rb::connect(None).expect("open a distinct foreign X11 client");
+        let version = connection
+            .xinput_xi_query_version(2, 0)
+            .expect("request foreign XI2 version")
+            .reply()
+            .expect("confirm foreign XI2 version");
+        assert_eq!(version.major_version, 2);
+        let devices = connection
+            .xinput_xi_query_device(xinput::Device::ALL_MASTER)
+            .expect("request the isolated master pair")
+            .reply()
+            .expect("query the isolated master pair");
+        assert_eq!(devices.infos.len(), 2, "this finite fixture requires exactly one master pair");
+        let pointer = devices
+            .infos
+            .iter()
+            .find(|info| info.enabled && info.type_ == xinput::DeviceType::MASTER_POINTER)
+            .expect("the only master pointer must be enabled");
+        let keyboard = devices
+            .infos
+            .iter()
+            .find(|info| info.enabled && info.type_ == xinput::DeviceType::MASTER_KEYBOARD)
+            .expect("the only master keyboard must be enabled");
+        assert_ne!(pointer.deviceid, keyboard.deviceid);
+        assert_eq!(pointer.attachment, keyboard.deviceid, "use the exact paired keyboard");
+        assert_eq!(keyboard.attachment, pointer.deviceid, "validate the reciprocal pointer pair");
+        let tree = connection
+            .query_tree(xid(window).parse().expect("the source XID fits u32"))
+            .expect("request the source root")
+            .reply()
+            .expect("query the source root on the foreign client");
+        assert_eq!(tree.parent, tree.root, "keep the source in the direct-root profile");
+        // Arm cleanup before dispatch: even a missing reply may leave a native grab to release.
+        let grab = Self {
+            connection,
+            root: tree.root,
+            pointer: pointer.deviceid,
+            keyboard: keyboard.deviceid,
+            active: true,
+        };
+        let mask = xinput::XIEventMask::KEY_PRESS | xinput::XIEventMask::KEY_RELEASE;
+        let reply = grab
+            .connection
+            .xinput_xi_grab_device(
+                grab.root,
+                x11rb::CURRENT_TIME,
+                0,
+                grab.keyboard,
+                xproto::GrabMode::ASYNC,
+                xproto::GrabMode::SYNC,
+                xinput::GrabOwner::NO_OWNER,
+                &[u32::from(mask)],
+            )
+            .expect("dispatch foreign keyboard grab with synchronous paired pointer")
+            .reply()
+            .expect("check foreign keyboard grab reply");
+        assert_eq!(reply.status, xproto::GrabStatus::SUCCESS, "the foreign freeze must be active");
+        grab
+    }
+
+    fn assert_primary_down(&self) {
+        let pointer = self
+            .connection
+            .xinput_xi_query_pointer(self.root, self.pointer)
+            .expect("request the frozen master pointer")
+            .reply()
+            .expect("round trip the frozen logical button state");
+        assert!(pointer.same_screen);
+        assert_eq!(pointer.root, self.root);
+        assert!(
+            pointer.buttons.first().is_some_and(|mask| mask & (1 << 1) != 0),
+            "the processed XTest mouseup must still be hidden behind the foreign freeze",
+        );
+    }
+
+    fn release(&mut self) -> Result<(), x11rb::errors::ReplyError> {
+        if self.active {
+            self.connection.xinput_xi_ungrab_device(x11rb::CURRENT_TIME, self.keyboard)?.check()?;
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ForeignKeyboardGrab {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            eprintln!("foreign keyboard grab cleanup: {error}");
+        }
+        // Dropping this separately owned connection also releases any indeterminate foreign grab.
+    }
+}
+
+fn allow_pointer_events(window: &Window, pointer: u16, mode: xinput::EventMode) {
+    let display = window.display_handle().expect("borrow Winit's live X11 display");
+    let xlib_xcb = x11_dl::xlib_xcb::Xlib_xcb::open().expect("load Xlib/XCB interop");
+    let raw = match display.as_raw() {
+        RawDisplayHandle::Xlib(handle) => {
+            let raw_display = handle.display.expect("Winit exposes its live Xlib display");
+            // SAFETY: the live Window and display borrow keep this Xlib Display alive on the
+            // event-loop thread. This only obtains its existing XCB connection.
+            unsafe { (xlib_xcb.XGetXCBConnection)(raw_display.as_ptr().cast()) }
+        },
+        RawDisplayHandle::Xcb(handle) => {
+            handle.connection.expect("Winit exposes its live XCB connection").as_ptr()
+        },
+        _ => panic!("the opted-in fixture requires an X11 display"),
+    };
+    assert!(!raw.is_null());
+    // SAFETY: this synchronous scope ends before the live Window/display borrow. false retains
+    // Winit's ownership, so this wrapper never disconnects the original connection. All cookies
+    // settle here; event ownership and normal FIFO dispatch remain with Winit.
+    let connection = unsafe { XCBConnection::from_raw_xcb_connection(raw.cast(), false) }
+        .expect("borrow the original Winit XCB connection");
+    connection
+        .xinput_xi_allow_events(x11rb::CURRENT_TIME, pointer, mode, 0, 0)
+        .expect("dispatch AllowEvents on Winit's original client")
+        .check()
+        .expect("check AllowEvents without claiming that it thawed a foreign freeze");
+}
+
+fn foreign_paired_keyboard_freeze(session: &mut CaptureSession) {
+    let press = press_primary(session);
+    acquisition_status(session, &press, Acquisition::Acquired);
+    assert!(session.fixture.acquisition_was_pending);
+    move_over_peer(session, &press, 100, 80);
+    let source = session.fixture.source.as_ref().unwrap().id();
+    let peer = session.fixture.peer.as_ref().unwrap().id();
+    let releases = session.fixture.primary_releases.len();
+    // The guard drops before CaptureSession's existing all-button/explicit-capture cleanup.
+    let mut foreign = ForeignKeyboardGrab::acquire(session.fixture.source.as_ref().unwrap());
+    inject(&["mouseup", "1", "getmouselocation"])
+        .expect("inject a real Primary release followed by an injector-side server round trip");
+    flush_polls(session);
+    foreign.assert_primary_down();
+    acquisition_status(session, &press, Acquisition::Acquired);
+    observe_unknown(session, &press, peer);
+    assert_eq!(session.fixture.primary_releases.len(), releases, "the real release is frozen");
+
+    for mode in [xinput::EventMode::ASYNC_DEVICE, xinput::EventMode::ASYNC_PAIR] {
+        allow_pointer_events(session.fixture.source.as_ref().unwrap(), foreign.pointer, mode);
+        flush_polls(session);
+        foreign.assert_primary_down();
+        acquisition_status(session, &press, Acquisition::Acquired);
+        observe_unknown(session, &press, peer);
+        assert_eq!(
+            session.fixture.primary_releases.len(),
+            releases,
+            "{mode:?} cannot release input frozen by another client",
+        );
+    }
+
+    foreign.release().expect("check the foreign keyboard ungrab before awaiting real release");
+    pump_until(session, "the frozen real release after foreign ungrab", |fixture| {
+        fixture.primary_releases.len() > releases
+    });
+    acquisition_status(session, &press, Acquisition::Unavailable);
+    session.fixture.retired_observation = Some(press.clone());
+    pump_until(session, "an unavailable observation for the released original press", |fixture| {
+        fixture.retired_observation.is_none()
+    });
+    flush_polls(session);
+    assert_eq!(
+        session.fixture.primary_releases.len(),
+        releases + 1,
+        "release arrives exactly once"
+    );
+    assert_eq!(session.fixture.primary_releases[releases], (source, press.device));
+    assert_eq!(session.fixture.primary_releases.len(), session.fixture.presses.len());
+    assert_eq!(session.fixture.presses.len(), 5);
+    assert!(!session.fixture.secondary_down);
+}
+
 #[test]
 #[ignore = "requires WINIT_X11_EXPLICIT_CAPTURE_TEST=1, isolated X11, XTest and xdotool"]
 fn explicit_capture_serializes_ordinary_grabs_and_cleans_up_exact_original_presses() {
@@ -514,4 +716,6 @@ fn explicit_capture_serializes_ordinary_grabs_and_cleans_up_exact_original_press
     assert_eq!(session.fixture.primary_releases.len(), session.fixture.presses.len());
     assert_eq!(session.fixture.presses.len(), 4);
     assert!(!session.fixture.secondary_down);
+
+    foreign_paired_keyboard_freeze(&mut session);
 }
