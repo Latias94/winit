@@ -190,6 +190,35 @@ pub fn register_xlib_error_hook(hook: XlibErrorHook) {
     crate::platform_impl::XLIB_ERROR_HOOKS.lock().unwrap().push(hook);
 }
 
+/// Result of an explicit source-directed capture operation.
+///
+/// Acquired reports a native effect followed by normal FIFO settlement. It does not establish
+/// fresh capture/delivery observation, uninterrupted earlier capture or freedom from freeze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X11PointerCaptureAcquisition {
+    /// The effect or its normal FIFO fence has not settled.
+    Pending,
+    /// The operation was accepted and its FIFO fence completed.
+    Acquired,
+    /// The original press or finite source profile cannot acquire capture.
+    Unavailable,
+    /// The active backend does not implement this X11 operation.
+    Unsupported,
+}
+
+/// Result of releasing the exact original explicit capture operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X11PointerCaptureRelease {
+    /// The exact checked native release completed.
+    Released,
+    /// The original operation or its release still owns an unresolved duty.
+    Pending,
+    /// This identity has no current explicit release duty.
+    Unavailable,
+    /// The active backend does not implement this X11 operation.
+    Unsupported,
+}
+
 /// Additional methods on [`ActiveEventLoop`] that are specific to X11.
 pub trait ActiveEventLoopExtX11 {
     /// True if the [`ActiveEventLoop`] uses X11.
@@ -202,6 +231,33 @@ pub trait ActiveEventLoopExtX11 {
     /// relevant native event invalidates it. The current proof is limited to the X connection's
     /// first screen because Winit's X resource database uses that screen's root.
     fn work_area_authority_snapshot(&self) -> Option<X11WorkAreaAuthoritySnapshot>;
+
+    /// Acquires unconfined, asynchronous, source-directed capture for one original Primary press.
+    ///
+    /// Call only after application drag ownership is established. This changes native routing;
+    /// it is not a pointer observation. The finite profile accepts only a viewable direct-root
+    /// source and an enabled exact master pointer. Ordinary window grabs and unresolved cleanup
+    /// exclude acquisition. One original press permits one attempt; a failed or revoked attempt
+    /// cannot be renewed into continuity. Drain normal events while Pending, then poll this same
+    /// identity. Acquired does not authorize a stationary action without independent fresh facts.
+    fn acquire_pointer_capture(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: crate::event::DeviceId,
+        expected_press: &crate::event::PointerPressToken,
+    ) -> X11PointerCaptureAcquisition;
+
+    /// Releases only the explicit operation tied to this connection, window, device and press.
+    ///
+    /// Primary termination, window mutation and device retirement also retain automatic cleanup
+    /// in the same owner. A late release cannot ungrab a successor. Pending retains the duty for
+    /// normal event-loop service; it must not be treated as release completion.
+    fn release_pointer_capture(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: crate::event::DeviceId,
+        expected_press: &crate::event::PointerPressToken,
+    ) -> X11PointerCaptureRelease;
 
     /// Samples a managed master pointer without replaying cached position or capture facts.
     ///
@@ -232,6 +288,40 @@ pub trait ActiveEventLoopExtX11 {
 }
 
 impl ActiveEventLoopExtX11 for ActiveEventLoop {
+    fn acquire_pointer_capture(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: crate::event::DeviceId,
+        expected_press: &crate::event::PointerPressToken,
+    ) -> X11PointerCaptureAcquisition {
+        match &self.p {
+            crate::platform_impl::ActiveEventLoop::X(event_loop) => {
+                event_loop.acquire_pointer_capture(expected_window, device_id, expected_press)
+            },
+            #[cfg(wayland_platform)]
+            crate::platform_impl::ActiveEventLoop::Wayland(_) => {
+                X11PointerCaptureAcquisition::Unsupported
+            },
+        }
+    }
+
+    fn release_pointer_capture(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: crate::event::DeviceId,
+        expected_press: &crate::event::PointerPressToken,
+    ) -> X11PointerCaptureRelease {
+        match &self.p {
+            crate::platform_impl::ActiveEventLoop::X(event_loop) => {
+                event_loop.release_pointer_capture(expected_window, device_id, expected_press)
+            },
+            #[cfg(wayland_platform)]
+            crate::platform_impl::ActiveEventLoop::Wayland(_) => {
+                X11PointerCaptureRelease::Unsupported
+            },
+        }
+    }
+
     #[inline]
     fn is_x11(&self) -> bool {
         !self.p.is_wayland()

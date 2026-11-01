@@ -43,6 +43,7 @@ mod event_processor;
 pub mod ffi;
 mod ime;
 mod monitor;
+mod pointer_capture;
 mod pointer_facts;
 mod pointer_observation;
 mod util;

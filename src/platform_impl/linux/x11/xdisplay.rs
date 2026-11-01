@@ -10,11 +10,15 @@ use crate::window::CursorIcon;
 use super::atoms::Atoms;
 use super::ffi;
 use super::monitor::MonitorHandle;
-use super::pointer_facts::{ImplicitPointerCaptures, PointerCaptureMutationGuard};
+use super::pointer_facts::{
+    ExplicitCaptureRelease, ImplicitPointerCaptures, PointerCaptureMutationGuard,
+    PointerGrabMutationGuard,
+};
 use super::work_area::{merge_event_masks, WorkAreaCache};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
+use x11rb::protocol::xinput::ConnectionExt as _;
 use x11rb::protocol::xproto::{self, ConnectionExt};
 use x11rb::resource_manager;
 use x11rb::xcb_ffi::XCBConnection;
@@ -74,6 +78,19 @@ pub struct XConnection {
 
 pub(super) struct NativeEventDispatchGuard(Arc<XConnection>);
 
+struct CaptureReleaseDispatch<'a> {
+    connection: &'a XConnection,
+    release: Option<ExplicitCaptureRelease>,
+}
+
+impl Drop for CaptureReleaseDispatch<'_> {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            self.connection.pointer_captures().complete_explicit_capture_release(release, false);
+        }
+    }
+}
+
 impl Drop for NativeEventDispatchGuard {
     fn drop(&mut self) {
         self.0.native_event_depth.fetch_sub(1, Ordering::Relaxed);
@@ -123,7 +140,12 @@ impl XConnection {
         dispatch()
     }
 
+    pub(super) fn try_pointer_grab_mutation(&self) -> Option<PointerGrabMutationGuard<'_>> {
+        PointerGrabMutationGuard::try_new(&self.pointer_captures, &self.native_event_depth)
+    }
+
     pub(super) fn sync_pointer_capture_mutations(&self) {
+        self.settle_explicit_pointer_releases();
         let needs_sync = {
             let mut captures = self.pointer_captures();
             captures.begin_sync(self.native_event_depth.load(Ordering::Relaxed))
@@ -134,6 +156,37 @@ impl XConnection {
                 self.sync_with_server().is_ok() && self.xcb_connection().has_error().is_none();
             self.pointer_captures().finish_sync(succeeded);
         }
+    }
+
+    pub(super) fn settle_explicit_pointer_releases(&self) {
+        if self.native_event_depth.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let releases = self.pointer_captures().claim_explicit_capture_releases();
+        for release in releases {
+            self.settle_explicit_pointer_release(release);
+        }
+    }
+
+    pub(super) fn settle_explicit_pointer_release(&self, release: ExplicitCaptureRelease) -> bool {
+        if !self.pointer_captures().begin_explicit_capture_release(&release) {
+            return false;
+        }
+        let device = release.device();
+        let mut dispatch = CaptureReleaseDispatch { connection: self, release: Some(release) };
+        // The row pins this exact duty until the checked request settles. Ordinary grabs
+        // and a successor explicit acquisition remain excluded across unlocked dispatch.
+        let succeeded = self
+            .xcb_connection()
+            .xinput_xi_ungrab_device(x11rb::CURRENT_TIME, device)
+            .ok()
+            .and_then(|request| request.check().ok())
+            .is_some()
+            && self.xcb_connection().has_error().is_none();
+        self.pointer_captures().complete_explicit_capture_release(
+            dispatch.release.take().expect("release dispatch completes its own duty once"),
+            succeeded,
+        )
     }
 
     pub(super) fn finish_pointer_capture_drain(&self) {

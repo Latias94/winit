@@ -1118,6 +1118,10 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
+        if xev.send_event != 0 {
+            // A client message cannot retire a live native window or remove its grab owner.
+            return;
+        }
         let wt = Self::window_target(&self.target);
 
         let window = xev.window as xproto::Window;

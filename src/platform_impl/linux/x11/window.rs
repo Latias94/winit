@@ -117,7 +117,8 @@ pub struct UnownedWindow {
     #[allow(dead_code)]
     screen_id: i32, // never changes
     selected_cursor: Mutex<SelectedCursor>,
-    cursor_grabbed_mode: Mutex<CursorGrabMode>,
+    // None retains an indeterminate native result until an explicit release succeeds.
+    cursor_grabbed_mode: Mutex<Option<CursorGrabMode>>,
     #[allow(clippy::mutex_atomic)]
     cursor_visible: Mutex<bool>,
     ime_sender: Mutex<ImeSender>,
@@ -345,7 +346,7 @@ impl UnownedWindow {
             root,
             screen_id,
             selected_cursor: Default::default(),
-            cursor_grabbed_mode: Mutex::new(CursorGrabMode::None),
+            cursor_grabbed_mode: Mutex::new(Some(CursorGrabMode::None)),
             cursor_visible: Mutex::new(true),
             ime_sender: Mutex::new(event_loop.ime_sender.clone()),
             shared_state: SharedState::new(guessed_monitor, &window_attrs),
@@ -1512,54 +1513,81 @@ impl UnownedWindow {
             return Err(ExternalError::NotSupported(NotSupportedError::new()));
         }
 
+        if self.cursor_grabbed_mode.try_lock().is_ok_and(|current| Some(mode) == *current) {
+            return Ok(());
+        }
+        let _mutation = self.xconn.try_pointer_grab_mutation().ok_or_else(|| {
+            ExternalError::Os(os_error!(OsError::Misc("Native pointer capture is busy")))
+        })?;
         let mut grabbed_lock = self.cursor_grabbed_mode.lock().unwrap();
-        if mode == *grabbed_lock {
+        if Some(mode) == *grabbed_lock {
             return Ok(());
         }
 
         // We ungrab before grabbing to prevent passive grabs from causing `AlreadyGrabbed`.
         // Therefore, this is common to both codepaths.
+        *grabbed_lock = None;
         self.xconn
-            .with_pointer_capture_mutation(None, || {
-                self.xconn.xcb_connection().ungrab_pointer(x11rb::CURRENT_TIME)
-            })
-            .expect_then_ignore_error("Failed to call `xcb_ungrab_pointer`");
-        *grabbed_lock = CursorGrabMode::None;
+            .xcb_connection()
+            .ungrab_pointer(x11rb::CURRENT_TIME)
+            .map_err(|error| {
+                ExternalError::Os(os_error!(OsError::XError(X11Error::from(error).into())))
+            })?
+            .check()
+            .map_err(|error| {
+                ExternalError::Os(os_error!(OsError::XError(X11Error::from(error).into())))
+            })?;
+        if let Some(error) = self.xconn.xcb_connection().has_error() {
+            return Err(ExternalError::Os(os_error!(OsError::XError(
+                X11Error::from(error).into()
+            ))));
+        }
+        *grabbed_lock = Some(CursorGrabMode::None);
 
         let result = match mode {
             CursorGrabMode::None => self.xconn.flush_requests().map_err(|err| {
                 ExternalError::Os(os_error!(OsError::XError(X11Error::Xlib(err).into())))
             }),
             CursorGrabMode::Confined => {
+                *grabbed_lock = None;
                 let result = self
                     .xconn
-                    .with_pointer_capture_mutation(None, || {
-                        self.xconn.xcb_connection().grab_pointer(
-                            true as _,
-                            self.xwindow,
-                            xproto::EventMask::BUTTON_PRESS
-                                | xproto::EventMask::BUTTON_RELEASE
-                                | xproto::EventMask::ENTER_WINDOW
-                                | xproto::EventMask::LEAVE_WINDOW
-                                | xproto::EventMask::POINTER_MOTION
-                                | xproto::EventMask::POINTER_MOTION_HINT
-                                | xproto::EventMask::BUTTON1_MOTION
-                                | xproto::EventMask::BUTTON2_MOTION
-                                | xproto::EventMask::BUTTON3_MOTION
-                                | xproto::EventMask::BUTTON4_MOTION
-                                | xproto::EventMask::BUTTON5_MOTION
-                                | xproto::EventMask::KEYMAP_STATE,
-                            xproto::GrabMode::ASYNC,
-                            xproto::GrabMode::ASYNC,
-                            self.xwindow,
-                            0u32,
-                            x11rb::CURRENT_TIME,
-                        )
-                    })
-                    .expect("Failed to call `grab_pointer`")
+                    .xcb_connection()
+                    .grab_pointer(
+                        true as _,
+                        self.xwindow,
+                        xproto::EventMask::BUTTON_PRESS
+                            | xproto::EventMask::BUTTON_RELEASE
+                            | xproto::EventMask::ENTER_WINDOW
+                            | xproto::EventMask::LEAVE_WINDOW
+                            | xproto::EventMask::POINTER_MOTION
+                            | xproto::EventMask::POINTER_MOTION_HINT
+                            | xproto::EventMask::BUTTON1_MOTION
+                            | xproto::EventMask::BUTTON2_MOTION
+                            | xproto::EventMask::BUTTON3_MOTION
+                            | xproto::EventMask::BUTTON4_MOTION
+                            | xproto::EventMask::BUTTON5_MOTION
+                            | xproto::EventMask::KEYMAP_STATE,
+                        xproto::GrabMode::ASYNC,
+                        xproto::GrabMode::ASYNC,
+                        self.xwindow,
+                        0u32,
+                        x11rb::CURRENT_TIME,
+                    )
+                    .map_err(|error| {
+                        ExternalError::Os(os_error!(OsError::XError(X11Error::from(error).into())))
+                    })?
                     .reply()
-                    .expect("Failed to receive reply from `grab_pointer`");
+                    .map_err(|error| {
+                        ExternalError::Os(os_error!(OsError::XError(X11Error::from(error).into())))
+                    })?;
 
+                if let Some(error) = self.xconn.xcb_connection().has_error() {
+                    return Err(ExternalError::Os(os_error!(OsError::XError(
+                        X11Error::from(error).into()
+                    ))));
+                }
+                *grabbed_lock = Some(CursorGrabMode::None);
                 match result.status {
                     xproto::GrabStatus::SUCCESS => Ok(()),
                     xproto::GrabStatus::ALREADY_GRABBED => {
@@ -1582,10 +1610,16 @@ impl UnownedWindow {
         };
 
         if result.is_ok() {
-            *grabbed_lock = mode;
+            *grabbed_lock = Some(mode);
         }
 
         result
+    }
+
+    pub(super) fn ordinary_pointer_grab_blocks_acquisition(&self) -> bool {
+        // The explicit row is reserved before this read, so an ordinary mutation cannot
+        // enter between checking existing windows and dispatching the explicit request.
+        self.cursor_grabbed_mode.try_lock().map_or(true, |mode| *mode != Some(CursorGrabMode::None))
     }
 
     #[inline]
@@ -1659,6 +1693,7 @@ impl UnownedWindow {
             })
         }
 
+        self.xconn.pointer_captures().retire_explicit_capture_for_window(self.xwindow);
         self.xconn
             .xcb_connection()
             .shape_rectangles(
@@ -1711,19 +1746,30 @@ impl UnownedWindow {
 
         // we can't use `set_cursor_grab(false)` here because it doesn't run `XUngrabPointer`
         // if the cursor isn't currently grabbed
+        let _mutation = self.xconn.try_pointer_grab_mutation().ok_or_else(|| {
+            ExternalError::Os(os_error!(OsError::Misc("Native pointer capture is busy")))
+        })?;
         let mut grabbed_lock = self.cursor_grabbed_mode.lock().unwrap();
+        *grabbed_lock = None;
         self.xconn
-            .with_pointer_capture_mutation(None, || {
-                self.xconn.xcb_connection().ungrab_pointer(x11rb::CURRENT_TIME)
-            })
+            .xcb_connection()
+            .ungrab_pointer(x11rb::CURRENT_TIME)
             .map_err(|err| {
                 ExternalError::Os(os_error!(OsError::XError(X11Error::from(err).into())))
             })?
-            .ignore_error();
+            .check()
+            .map_err(|err| {
+                ExternalError::Os(os_error!(OsError::XError(X11Error::from(err).into())))
+            })?;
+        if let Some(error) = self.xconn.xcb_connection().has_error() {
+            return Err(ExternalError::Os(os_error!(OsError::XError(
+                X11Error::from(error).into()
+            ))));
+        }
+        *grabbed_lock = Some(CursorGrabMode::None);
         self.xconn.flush_requests().map_err(|err| {
             ExternalError::Os(os_error!(OsError::XError(X11Error::Xlib(err).into())))
         })?;
-        *grabbed_lock = CursorGrabMode::None;
 
         // we keep the lock until we are done
         self.xconn
