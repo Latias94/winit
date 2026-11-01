@@ -218,6 +218,7 @@ impl ApplicationHandler for CaptureFixture {
 struct CaptureSession {
     fixture: CaptureFixture,
     event_loop: EventLoop<()>,
+    protocol_regrab_pointer: Option<u16>,
 }
 
 struct ReleaseCaptures {
@@ -297,6 +298,15 @@ impl Drop for CaptureSession {
                     cleanup.presses.len()
                 );
                 break;
+            }
+        }
+        if let Some(pointer) = self.protocol_regrab_pointer.take() {
+            // The original claim cleanup runs first. Cover an indeterminate test-only regrab on
+            // Winit's own client/device; the fifth press is final, so there is no successor grab.
+            if let Err(error) = with_winit_connection(source, |connection| {
+                connection.xinput_xi_ungrab_device(x11rb::CURRENT_TIME, pointer)?.check()
+            }) {
+                eprintln!("test-only XI2 pointer regrab cleanup: {error}");
             }
         }
         self.event_loop.pump_app_events(Some(Duration::ZERO), &mut cleanup);
@@ -410,7 +420,7 @@ struct ForeignKeyboardGrab {
 }
 
 impl ForeignKeyboardGrab {
-    fn acquire(window: &Window) -> Self {
+    fn new(window: &Window) -> Self {
         let (connection, _) = x11rb::connect(None).expect("open a distinct foreign X11 client");
         let version = connection
             .xinput_xi_query_version(2, 0)
@@ -443,22 +453,26 @@ impl ForeignKeyboardGrab {
             .reply()
             .expect("query the source root on the foreign client");
         assert_eq!(tree.parent, tree.root, "keep the source in the direct-root profile");
-        // Arm cleanup before dispatch: even a missing reply may leave a native grab to release.
-        let grab = Self {
+        Self {
             connection,
             root: tree.root,
             pointer: pointer.deviceid,
             keyboard: keyboard.deviceid,
-            active: true,
-        };
+            active: false,
+        }
+    }
+
+    fn freeze(&mut self) {
+        // Arm cleanup before dispatch: even a missing reply may leave a native grab to release.
+        self.active = true;
         let mask = xinput::XIEventMask::KEY_PRESS | xinput::XIEventMask::KEY_RELEASE;
-        let reply = grab
+        let reply = self
             .connection
             .xinput_xi_grab_device(
-                grab.root,
+                self.root,
                 x11rb::CURRENT_TIME,
                 0,
-                grab.keyboard,
+                self.keyboard,
                 xproto::GrabMode::ASYNC,
                 xproto::GrabMode::SYNC,
                 xinput::GrabOwner::NO_OWNER,
@@ -468,7 +482,6 @@ impl ForeignKeyboardGrab {
             .reply()
             .expect("check foreign keyboard grab reply");
         assert_eq!(reply.status, xproto::GrabStatus::SUCCESS, "the foreign freeze must be active");
-        grab
     }
 
     fn assert_primary_down(&self) {
@@ -504,32 +517,67 @@ impl Drop for ForeignKeyboardGrab {
     }
 }
 
-fn allow_pointer_events(window: &Window, pointer: u16, mode: xinput::EventMode) {
-    let display = window.display_handle().expect("borrow Winit's live X11 display");
-    let xlib_xcb = x11_dl::xlib_xcb::Xlib_xcb::open().expect("load Xlib/XCB interop");
+fn with_winit_connection<T>(
+    window: &Window,
+    request: impl FnOnce(&XCBConnection) -> Result<T, x11rb::errors::ReplyError>,
+) -> Result<T, String> {
+    let display = window.display_handle().map_err(|error| error.to_string())?;
+    let xlib_xcb = x11_dl::xlib_xcb::Xlib_xcb::open().map_err(|error| error.to_string())?;
     let raw = match display.as_raw() {
         RawDisplayHandle::Xlib(handle) => {
-            let raw_display = handle.display.expect("Winit exposes its live Xlib display");
+            let raw_display = handle.display.ok_or("Winit must expose its live Xlib display")?;
             // SAFETY: the live Window and display borrow keep this Xlib Display alive on the
             // event-loop thread. This only obtains its existing XCB connection.
             unsafe { (xlib_xcb.XGetXCBConnection)(raw_display.as_ptr().cast()) }
         },
         RawDisplayHandle::Xcb(handle) => {
-            handle.connection.expect("Winit exposes its live XCB connection").as_ptr()
+            handle.connection.ok_or("Winit must expose its live XCB connection")?.as_ptr()
         },
-        _ => panic!("the opted-in fixture requires an X11 display"),
+        _ => return Err("the opted-in fixture requires an X11 display".into()),
     };
-    assert!(!raw.is_null());
+    if raw.is_null() {
+        return Err("Winit's live XCB connection must not be null".into());
+    }
     // SAFETY: this synchronous scope ends before the live Window/display borrow. false retains
     // Winit's ownership, so this wrapper never disconnects the original connection. All cookies
     // settle here; event ownership and normal FIFO dispatch remain with Winit.
     let connection = unsafe { XCBConnection::from_raw_xcb_connection(raw.cast(), false) }
-        .expect("borrow the original Winit XCB connection");
-    connection
-        .xinput_xi_allow_events(x11rb::CURRENT_TIME, pointer, mode, 0, 0)
-        .expect("dispatch AllowEvents on Winit's original client")
-        .check()
-        .expect("check AllowEvents without claiming that it thawed a foreign freeze");
+        .map_err(|error| error.to_string())?;
+    request(&connection).map_err(|error| error.to_string())
+}
+
+fn allow_pointer_events(window: &Window, pointer: u16, mode: xinput::EventMode) {
+    with_winit_connection(window, |connection| {
+        connection.xinput_xi_allow_events(x11rb::CURRENT_TIME, pointer, mode, 0, 0)?.check()
+    })
+    .expect("check AllowEvents without claiming that it thawed a foreign freeze");
+}
+
+fn xi2_regrab_pointer(window: &Window, pointer: u16) -> xproto::GrabStatus {
+    // Match pointer_capture.rs's XI2 mask and owner parameter on the original client. This raw
+    // protocol experiment is not a new Winit capture API. Success describes only the server's
+    // execution point, not old-lease continuity, physical buttons or full stationary readiness.
+    with_winit_connection(window, |connection| {
+        let mask = xinput::XIEventMask::BUTTON_PRESS
+            | xinput::XIEventMask::BUTTON_RELEASE
+            | xinput::XIEventMask::MOTION
+            | xinput::XIEventMask::ENTER
+            | xinput::XIEventMask::LEAVE;
+        Ok(connection
+            .xinput_xi_grab_device(
+                xid(window).parse().expect("the source XID fits u32"),
+                x11rb::CURRENT_TIME,
+                0_u32,
+                pointer,
+                xproto::GrabMode::ASYNC,
+                xproto::GrabMode::ASYNC,
+                xinput::GrabOwner::NO_OWNER,
+                &[u32::from(mask)],
+            )?
+            .reply()?
+            .status)
+    })
+    .expect("check the test-only same-client XI2 pointer regrab")
 }
 
 fn foreign_paired_keyboard_freeze(session: &mut CaptureSession) {
@@ -541,7 +589,20 @@ fn foreign_paired_keyboard_freeze(session: &mut CaptureSession) {
     let peer = session.fixture.peer.as_ref().unwrap().id();
     let releases = session.fixture.primary_releases.len();
     // The guard drops before CaptureSession's existing all-button/explicit-capture cleanup.
-    let mut foreign = ForeignKeyboardGrab::acquire(session.fixture.source.as_ref().unwrap());
+    let mut foreign = ForeignKeyboardGrab::new(session.fixture.source.as_ref().unwrap());
+    // The sole enabled master pointer is the exact device used by both XI2 regrab and freeze.
+    // Arm fallback cleanup before dispatch, including a successful grab with a missing reply.
+    session.protocol_regrab_pointer = Some(foreign.pointer);
+    assert_eq!(
+        xi2_regrab_pointer(session.fixture.source.as_ref().unwrap(), foreign.pointer),
+        xproto::GrabStatus::SUCCESS,
+        "same-client XI2 regrab succeeds at the unfrozen server execution point",
+    );
+    flush_polls(session);
+    acquisition_status(session, &press, Acquisition::Acquired);
+    observe_unknown(session, &press, peer);
+
+    foreign.freeze();
     inject(&["mouseup", "1", "getmouselocation"])
         .expect("inject a real Primary release followed by an injector-side server round trip");
     flush_polls(session);
@@ -549,6 +610,21 @@ fn foreign_paired_keyboard_freeze(session: &mut CaptureSession) {
     acquisition_status(session, &press, Acquisition::Acquired);
     observe_unknown(session, &press, peer);
     assert_eq!(session.fixture.primary_releases.len(), releases, "the real release is frozen");
+
+    assert_eq!(
+        xi2_regrab_pointer(session.fixture.source.as_ref().unwrap(), foreign.pointer),
+        xproto::GrabStatus::FROZEN,
+        "same-client existing XI2 grab must still check a foreign paired-device freeze",
+    );
+    flush_polls(session);
+    foreign.assert_primary_down();
+    acquisition_status(session, &press, Acquisition::Acquired);
+    observe_unknown(session, &press, peer);
+    assert_eq!(
+        session.fixture.primary_releases.len(),
+        releases,
+        "a Frozen regrab must leave the real release queued",
+    );
 
     for mode in [xinput::EventMode::ASYNC_DEVICE, xinput::EventMode::ASYNC_PAIR] {
         allow_pointer_events(session.fixture.source.as_ref().unwrap(), foreign.pointer, mode);
@@ -595,7 +671,11 @@ fn explicit_capture_serializes_ordinary_grabs_and_cleans_up_exact_original_press
     assert!(std::env::var_os("DISPLAY").is_some(), "the isolated DISPLAY is required");
     // The test thread owns and pumps the event loop throughout; no background GUI thread is used.
     let event_loop = EventLoop::builder().with_x11().with_any_thread(true).build().unwrap();
-    let mut session = CaptureSession { fixture: CaptureFixture::default(), event_loop };
+    let mut session = CaptureSession {
+        fixture: CaptureFixture::default(),
+        event_loop,
+        protocol_regrab_pointer: None,
+    };
     pump_until(&mut session, "both override-redirect windows mapped", |fixture| {
         fixture.source.as_ref().is_some_and(|window| window.is_visible() == Some(true))
             && fixture.peer.as_ref().is_some_and(|window| window.is_visible() == Some(true))
