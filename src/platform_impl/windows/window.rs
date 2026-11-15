@@ -1204,6 +1204,7 @@ impl InitData<'_> {
             _file_drop_handler: file_drop_handler,
             userdata_removed: Cell::new(false),
             recurse_depth: Cell::new(0),
+            capture_release: Default::default(),
         }
     }
 

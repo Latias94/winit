@@ -191,6 +191,7 @@ mod ime;
 mod keyboard;
 mod keyboard_layout;
 mod monitor;
+mod mouse_capture;
 mod raw_input;
 mod window;
 mod window_state;

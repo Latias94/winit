@@ -92,6 +92,7 @@ use crate::window::{
 };
 use runner::{EventLoopRunner, EventLoopRunnerShared};
 
+use super::mouse_capture::CaptureReleaseScope;
 use super::window::set_skip_taskbar;
 use super::SelectedCursor;
 
@@ -137,6 +138,7 @@ pub(crate) struct WindowData {
     pub _file_drop_handler: Option<FileDropHandler>,
     pub userdata_removed: Cell<bool>,
     pub recurse_depth: Cell<u32>,
+    pub(super) capture_release: CaptureReleaseScope,
 }
 
 impl WindowData {
@@ -1008,10 +1010,8 @@ unsafe fn capture_mouse(window: HWND, window_state: &mut WindowState) {
 
 /// Release mouse input, stopping windows on this thread from receiving mouse input when the cursor
 /// is outside the window.
-unsafe fn release_mouse(
-    window: HWND,
-    mut window_state: MutexGuard<'_, WindowState>,
-) -> PointerWindowRoute {
+unsafe fn release_mouse(window: HWND, userdata: &WindowData) -> PointerWindowRoute {
+    let mut window_state = userdata.window_state_lock();
     window_state.mouse.capture_count = window_state.mouse.capture_count.saturating_sub(1);
     if window_state.mouse.capture_count != 0 {
         return PointerWindowRoute::Window(RootWindowId(WindowId(window)));
@@ -1019,7 +1019,9 @@ unsafe fn release_mouse(
 
     // ReleaseCapture() causes a WM_CAPTURECHANGED where we lock the window_state.
     drop(window_state);
-    if unsafe { ReleaseCapture() } == 0 {
+    // Its synchronous no-owner notification is already represented by the real
+    // button-up event. Publishing it first would incorrectly cancel that release.
+    if userdata.capture_release.with_release(|| unsafe { ReleaseCapture() }) == 0 {
         PointerWindowRoute::Unknown
     } else {
         PointerWindowRoute::None
@@ -1959,7 +1961,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Left;
             use crate::event::WindowEvent::MouseInput;
 
-            let capture = unsafe { release_mouse(window, userdata.window_state_lock()) };
+            let capture = unsafe { release_mouse(window, userdata) };
 
             update_modifiers(window, userdata);
 
@@ -2017,7 +2019,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Right;
             use crate::event::WindowEvent::MouseInput;
 
-            let capture = unsafe { release_mouse(window, userdata.window_state_lock()) };
+            let capture = unsafe { release_mouse(window, userdata) };
 
             update_modifiers(window, userdata);
 
@@ -2075,7 +2077,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseButton::Middle;
             use crate::event::WindowEvent::MouseInput;
 
-            let capture = unsafe { release_mouse(window, userdata.window_state_lock()) };
+            let capture = unsafe { release_mouse(window, userdata) };
 
             update_modifiers(window, userdata);
 
@@ -2139,7 +2141,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::WindowEvent::MouseInput;
             let xbutton = super::get_xbutton_wparam(wparam as u32);
 
-            let capture = unsafe { release_mouse(window, userdata.window_state_lock()) };
+            let capture = unsafe { release_mouse(window, userdata) };
 
             update_modifiers(window, userdata);
 
@@ -2168,6 +2170,7 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_CAPTURECHANGED => {
+            let expected_release = userdata.capture_release.is_expected_change(lparam == 0);
             // lparam here is a handle to the window which is gaining mouse capture.
             // If it is the same as our window, then we're essentially retaining the capture. This
             // can happen if `SetCapture` is called on our window when it already has the mouse
@@ -2182,10 +2185,12 @@ unsafe fn public_window_callback_inner(
             if !matches!(capture, PointerWindowRoute::Window(_)) {
                 userdata.window_state_lock().mouse.capture_count = 0;
             }
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: WindowEvent::PointerCaptureChanged { device_id: DEVICE_ID, capture },
-            });
+            if !expected_release {
+                userdata.send_event(Event::WindowEvent {
+                    window_id: RootWindowId(WindowId(window)),
+                    event: WindowEvent::PointerCaptureChanged { device_id: DEVICE_ID, capture },
+                });
+            }
             result = ProcResult::Value(0);
         },
 
