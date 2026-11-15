@@ -26,7 +26,7 @@ use super::event::{
     code_to_key, code_to_location, create_key_event, event_mods, lalt_pressed, ralt_pressed,
     scancode_to_physicalkey, KeyEventExtra,
 };
-use super::pointer::PrimaryPressState;
+use super::pointer::{dispatch_primary_down, PrimaryPressState};
 use super::window::WinitWindow;
 use super::DEVICE_ID;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
@@ -604,8 +604,11 @@ declare_class!(
         #[method(mouseDown:)]
         fn mouse_down(&self, event: &NSEvent) {
             trace_scope!("mouseDown:");
-            self.mouse_motion(event);
-            self.mouse_click(event, ElementState::Pressed);
+            dispatch_primary_down(
+                self.ivars().pressed_mouse_buttons.get(),
+                || self.mouse_motion(event),
+                || self.mouse_click(event, ElementState::Pressed),
+            );
         }
 
         #[method(mouseUp:)]
