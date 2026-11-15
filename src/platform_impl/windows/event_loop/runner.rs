@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -35,6 +35,8 @@ pub(crate) struct EventLoopRunner<T: 'static> {
     last_events_cleared: Cell<Instant>,
     event_handler: EventHandler<T>,
     event_buffer: RefCell<VecDeque<BufferedEvent<T>>>,
+    // HWND membership follows WindowData lifetime; foreign userdata is never inspected.
+    windows: RefCell<BTreeSet<HWND>>,
 
     panic_error: Cell<Option<PanicError>>,
 }
@@ -72,6 +74,7 @@ impl<T> EventLoopRunner<T> {
             last_events_cleared: Cell::new(Instant::now()),
             event_handler: Cell::new(None),
             event_buffer: RefCell::new(VecDeque::new()),
+            windows: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -114,6 +117,7 @@ impl<T> EventLoopRunner<T> {
             last_events_cleared: _,
             event_handler,
             event_buffer: _,
+            windows: _,
         } = self;
         interrupt_msg_dispatch.set(false);
         runner_state.set(RunnerState::Uninitialized);
@@ -125,6 +129,18 @@ impl<T> EventLoopRunner<T> {
 
 /// State retrieval functions.
 impl<T> EventLoopRunner<T> {
+    pub(super) fn register_window(&self, window: HWND) {
+        self.windows.borrow_mut().insert(window);
+    }
+
+    pub(super) fn unregister_window(&self, window: HWND) {
+        self.windows.borrow_mut().remove(&window);
+    }
+
+    pub(super) fn owns_window(&self, window: HWND) -> bool {
+        self.windows.borrow().contains(&window)
+    }
+
     #[allow(unused)]
     pub fn thread_msg_target(&self) -> HWND {
         self.thread_msg_target

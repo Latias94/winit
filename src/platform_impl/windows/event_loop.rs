@@ -32,7 +32,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Controls::{HOVER_DEFAULT, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::Ime::{GCS_COMPSTR, GCS_RESULTSTR, ISC_SHOWUICOMPOSITIONWINDOW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetCapture, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::Input::Pointer::{
     POINTER_FLAG_DOWN, POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
@@ -44,7 +44,7 @@ use windows_sys::Win32::UI::Input::Touch::{
 use windows_sys::Win32::UI::Input::{RAWINPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMenu, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
+    GetMenu, IsWindow, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
     RegisterClassExW, RegisterWindowMessageA, SetCursor, SetWindowPos, TranslateMessage,
     CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT,
     MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, PT_PEN,
@@ -148,6 +148,22 @@ impl WindowData {
 
     fn window_state_lock(&self) -> MutexGuard<'_, WindowState> {
         self.window_state.lock().unwrap()
+    }
+
+    fn capture_window_route(
+        &self,
+        owner: HWND,
+        no_owner: PointerWindowRoute,
+    ) -> PointerWindowRoute {
+        if owner == 0 {
+            no_owner
+        } else if self.event_loop_runner.owns_window(owner) {
+            PointerWindowRoute::Window(RootWindowId(WindowId(owner)))
+        } else if unsafe { IsWindow(owner) } != 0 {
+            PointerWindowRoute::Foreign
+        } else {
+            PointerWindowRoute::Unknown
+        }
     }
 }
 
@@ -1013,18 +1029,24 @@ unsafe fn capture_mouse(window: HWND, window_state: &mut WindowState) {
 unsafe fn release_mouse(window: HWND, userdata: &WindowData) -> PointerWindowRoute {
     let mut window_state = userdata.window_state_lock();
     window_state.mouse.capture_count = window_state.mouse.capture_count.saturating_sub(1);
-    if window_state.mouse.capture_count != 0 {
-        return PointerWindowRoute::Window(RootWindowId(WindowId(window)));
-    }
-
+    let buttons_remain = window_state.mouse.capture_count != 0;
     // ReleaseCapture() causes a WM_CAPTURECHANGED where we lock the window_state.
     drop(window_state);
+    let owner = unsafe { GetCapture() };
+    if owner != window || buttons_remain {
+        // The count belongs to this window's button history, not the thread's
+        // actual capture owner. A late up must not release another window.
+        // A null GetCapture only excludes an owner on this thread.
+        return userdata.capture_window_route(owner, PointerWindowRoute::Unknown);
+    }
     // Its synchronous no-owner notification is already represented by the real
     // button-up event. Publishing it first would incorrectly cancel that release.
-    if userdata.capture_release.with_release(|| unsafe { ReleaseCapture() }) == 0 {
-        PointerWindowRoute::Unknown
-    } else {
+    let released = userdata.capture_release.with_release(|| unsafe { ReleaseCapture() }) != 0;
+    let owner = unsafe { GetCapture() };
+    if released && owner == 0 {
         PointerWindowRoute::None
+    } else {
+        userdata.capture_window_route(owner, PointerWindowRoute::Unknown)
     }
 }
 
@@ -1176,6 +1198,8 @@ pub(super) unsafe extern "system" fn public_window_callback(
 
             let result = match unsafe { initdata.on_nccreate(window) } {
                 Some(userdata) => unsafe {
+                    let window_data = &*(userdata as *const WindowData);
+                    window_data.event_loop_runner.register_window(window);
                     super::set_window_long(window, GWL_USERDATA, userdata as _);
                     DefWindowProcW(window, msg, wparam, lparam)
                 },
@@ -1375,6 +1399,7 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_NCDESTROY => {
+            userdata.event_loop_runner.unregister_window(window);
             unsafe { super::set_window_long(window, GWL_USERDATA, 0) };
             userdata.userdata_removed.set(true);
             result = ProcResult::Value(0);
@@ -2175,14 +2200,8 @@ unsafe fn public_window_callback_inner(
             // If it is the same as our window, then we're essentially retaining the capture. This
             // can happen if `SetCapture` is called on our window when it already has the mouse
             // capture.
-            let capture = if lparam == 0 {
-                PointerWindowRoute::None
-            } else if lparam == window {
-                PointerWindowRoute::Window(RootWindowId(WindowId(window)))
-            } else {
-                PointerWindowRoute::Foreign
-            };
-            if !matches!(capture, PointerWindowRoute::Window(_)) {
+            let capture = userdata.capture_window_route(lparam, PointerWindowRoute::None);
+            if lparam != window {
                 userdata.window_state_lock().mouse.capture_count = 0;
             }
             if !expected_release {
