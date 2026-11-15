@@ -17,8 +17,8 @@ use core_foundation::runloop::{
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
 use objc2::sel;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWindow};
-use objc2_foundation::{MainThreadMarker, NSObjectProtocol};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask, NSWindow};
+use objc2_foundation::{MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSObjectProtocol};
 
 use super::app::override_send_event;
 use super::app_state::{ApplicationDelegate, HandlePendingUserEvents};
@@ -26,11 +26,11 @@ use super::event::dummy_event;
 use super::monitor::{self, MonitorHandle};
 use super::observer::setup_control_flow_observers;
 use crate::error::EventLoopError;
-use crate::event::Event;
+use crate::event::{DeviceId, Event, PointerPressToken};
 use crate::event_loop::{
     ActiveEventLoop as RootWindowTarget, ControlFlow, DeviceEvents, EventLoopClosed,
 };
-use crate::platform::macos::ActivationPolicy;
+use crate::platform::macos::{ActivationPolicy, MacOSPointerObservation};
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::platform::cursor::CustomCursor;
 use crate::window::{CustomCursor as RootCustomCursor, CustomCursorSource, Theme};
@@ -72,6 +72,49 @@ pub struct ActiveEventLoop {
 }
 
 impl ActiveEventLoop {
+    pub(super) fn pointer_observation_order_ready(&self) -> bool {
+        if !self.delegate.pointer_observation_order_ready() {
+            return false;
+        }
+        let app = NSApplication::sharedApplication(self.mtm);
+        let pending = unsafe {
+            app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&NSDate::distantPast()),
+                NSDefaultRunLoopMode,
+                false,
+            )
+        };
+        pending.is_none() && self.delegate.pointer_observation_order_ready()
+    }
+
+    pub(crate) fn observe_pointer(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: DeviceId,
+        expected_press: Option<&PointerPressToken>,
+    ) -> MacOSPointerObservation {
+        if device_id != super::DEVICE_ID {
+            return MacOSPointerObservation::Unsupported;
+        }
+        if !self.pointer_observation_order_ready() {
+            return MacOSPointerObservation::Unavailable;
+        }
+        let app = NSApplication::sharedApplication(self.mtm);
+        let source = app.windows().into_iter().find_map(|window| {
+            if !window.is_kind_of::<super::window::WinitWindow>() {
+                return None;
+            }
+            // SAFETY: The dynamic class check proves the concrete window type.
+            let window = unsafe { Retained::cast::<super::window::WinitWindow>(window) };
+            (crate::window::WindowId(window.id()) == expected_window).then_some(window)
+        });
+        let Some(source) = source.filter(|window| window.isVisible()) else {
+            return MacOSPointerObservation::Unavailable;
+        };
+        source.view().observe_pointer(self, expected_press)
+    }
+
     pub(super) fn new_root(delegate: Retained<ApplicationDelegate>) -> RootWindowTarget {
         let mtm = MainThreadMarker::from(&*delegate);
         let p = Self { delegate, mtm };

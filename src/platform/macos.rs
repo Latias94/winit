@@ -478,6 +478,19 @@ impl MonitorHandleExtMacOS for MonitorHandle {
 
 /// Additional methods on [`ActiveEventLoop`] that are specific to macOS.
 pub trait ActiveEventLoopExtMacOS {
+    /// Samples current pointer position and hover after queued native callbacks have drained.
+    ///
+    /// An expected press must still belong to this live source view. Global button state is
+    /// only negative evidence: observing all buttons up cancels that exact old sequence without
+    /// synthesizing a release or a drop. A held button does not prove continuity of an AppKit
+    /// drag, so stationary capture and delivery remain Unknown. This does not acquire capture.
+    fn observe_pointer(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: crate::event::DeviceId,
+        expected_press: Option<&crate::event::PointerPressToken>,
+    ) -> MacOSPointerObservation;
+
     /// Hide the entire application. In most applications this is typically triggered with
     /// Command-H.
     fn hide_application(&self);
@@ -493,6 +506,15 @@ pub trait ActiveEventLoopExtMacOS {
 }
 
 impl ActiveEventLoopExtMacOS for ActiveEventLoop {
+    fn observe_pointer(
+        &self,
+        expected_window: crate::window::WindowId,
+        device_id: crate::event::DeviceId,
+        expected_press: Option<&crate::event::PointerPressToken>,
+    ) -> MacOSPointerObservation {
+        self.p.observe_pointer(expected_window, device_id, expected_press)
+    }
+
     fn hide_application(&self) {
         self.p.hide_application()
     }
@@ -508,6 +530,22 @@ impl ActiveEventLoopExtMacOS for ActiveEventLoop {
     fn allows_automatic_window_tabbing(&self) -> bool {
         self.p.allows_automatic_window_tabbing()
     }
+}
+
+/// One conservative current AppKit pointer sample, independent of prior event geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MacOSPointerObservation {
+    /// Fresh position and hover. Capture and delivery remain Unknown.
+    Observed {
+        /// Current facts; no event-local position or geometry is fabricated.
+        facts: crate::event::PointerEventFacts,
+        /// Unknown because global button state does not prove native delivery.
+        delivery: crate::event::PointerWindowRoute,
+    },
+    /// Pending events, retired identity, or missing native facts prevent a sample.
+    Unavailable,
+    /// The device is not the backend's combined mouse pointer.
+    Unsupported,
 }
 
 /// Option as alt behavior.

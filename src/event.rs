@@ -61,7 +61,7 @@ use crate::platform_impl::x11::PointerPressConnectionDomain;
 
 #[cfg(not(x11_platform))]
 #[derive(Debug)]
-struct PointerPressConnectionDomain;
+pub(crate) struct PointerPressConnectionDomain;
 
 /// Describes a generic event.
 ///
@@ -162,7 +162,7 @@ pub enum StartCause {
 /// not prove that the button remains down, that capture is continuous, or that any window owns
 /// delivery. The native backend must separately validate a retained token before using it.
 ///
-/// Currently only X11 produces these identities. Other backends report `None` on mouse input.
+/// X11 and macOS produce these identities. Other backends report `None` on mouse input.
 #[derive(Clone)]
 pub struct PointerPressToken {
     domain: Arc<PointerPressConnectionDomain>,
@@ -201,6 +201,16 @@ impl PointerPressToken {
 
     pub(crate) fn x11_identity(&self) -> (&Arc<PointerPressConnectionDomain>, NonZeroU64) {
         (&self.domain, self.sequence)
+    }
+}
+
+#[cfg(macos_platform)]
+impl PointerPressToken {
+    pub(crate) fn from_macos(
+        domain: Arc<PointerPressConnectionDomain>,
+        sequence: NonZeroU64,
+    ) -> Self {
+        Self { domain, sequence }
     }
 }
 

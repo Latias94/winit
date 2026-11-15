@@ -41,6 +41,8 @@ pub(super) struct AppState {
     start_time: Cell<Option<Instant>>,
     wait_timeout: Cell<Option<Instant>>,
     pending_redraw: RefCell<Vec<WindowId>>,
+    pending_events: Cell<usize>,
+    native_dispatch_depth: Cell<usize>,
     // NOTE: This is strongly referenced by our `NSWindowDelegate` and our `NSView` subclass, and
     // as such should be careful to not add fields that, in turn, strongly reference those.
 }
@@ -104,6 +106,8 @@ impl ApplicationDelegate {
             start_time: Cell::new(None),
             wait_timeout: Cell::new(None),
             pending_redraw: RefCell::new(vec![]),
+            pending_events: Cell::new(0),
+            native_dispatch_depth: Cell::new(0),
         });
         unsafe { msg_send_id![super(this), init] }
     }
@@ -284,6 +288,23 @@ impl ApplicationDelegate {
         self.maybe_queue_event(Event::WindowEvent { window_id: RootWindowId(window_id), event });
     }
 
+    pub(super) fn pointer_observation_order_ready(&self) -> bool {
+        self.ivars().pending_events.get() == 0 && self.ivars().native_dispatch_depth.get() == 0
+    }
+
+    pub(super) fn with_native_dispatch<R>(&self, dispatch: impl FnOnce() -> R) -> R {
+        let depth = &self.ivars().native_dispatch_depth;
+        depth.set(depth.get() + 1);
+        struct ResetDepth<'a>(&'a Cell<usize>);
+        impl Drop for ResetDepth<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        let _reset = ResetDepth(depth);
+        dispatch()
+    }
+
     pub fn handle_window_event(&self, window_id: WindowId, event: WindowEvent) {
         self.handle_event(Event::WindowEvent { window_id: RootWindowId(window_id), event });
     }
@@ -333,7 +354,11 @@ impl ApplicationDelegate {
         } else {
             tracing::debug!(?event, "had to queue event since another is currently being handled");
             let this = self.retain();
-            self.ivars().run_loop.queue_closure(move || this.handle_event(event));
+            self.ivars().pending_events.set(self.ivars().pending_events.get() + 1);
+            self.ivars().run_loop.queue_closure(move || {
+                this.ivars().pending_events.set(this.ivars().pending_events.get() - 1);
+                this.handle_event(event);
+            });
         }
     }
 

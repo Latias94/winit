@@ -26,6 +26,7 @@ use super::event::{
     code_to_key, code_to_location, create_key_event, event_mods, lalt_pressed, ralt_pressed,
     scancode_to_physicalkey, KeyEventExtra,
 };
+use super::pointer::PrimaryPressState;
 use super::window::WinitWindow;
 use super::DEVICE_ID;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
@@ -34,7 +35,7 @@ use crate::event::{
     PointerEventFacts, PointerEventGeometry, PointerWindowRoute, TouchPhase, WindowEvent,
 };
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
-use crate::platform::macos::OptionAsAlt;
+use crate::platform::macos::{MacOSPointerObservation, OptionAsAlt};
 use crate::window::WindowId as RootWindowId;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -135,6 +136,7 @@ pub struct ViewState {
 
     cursor_state: RefCell<CursorState>,
     pressed_mouse_buttons: Cell<NSUInteger>,
+    primary_press: RefCell<PrimaryPressState>,
     ime_position: Cell<NSPoint>,
     ime_size: Cell<NSSize>,
     modifiers: Cell<Modifiers>,
@@ -823,6 +825,7 @@ impl WinitView {
             app_delegate: app_delegate.retain(),
             cursor_state: Default::default(),
             pressed_mouse_buttons: Default::default(),
+            primary_press: Default::default(),
             ime_position: Default::default(),
             ime_size: Default::default(),
             modifiers: Default::default(),
@@ -942,11 +945,48 @@ impl WinitView {
     /// Terminates this view's implicit mouse capture after the platform stops
     /// delivering the corresponding button sequence.
     pub(super) fn reset_pointer_capture(&self) {
+        self.ivars().primary_press.borrow_mut().release();
         if clear_pressed_mouse_buttons(&self.ivars().pressed_mouse_buttons) {
             self.queue_event(WindowEvent::PointerCaptureChanged {
                 device_id: DEVICE_ID,
                 capture: PointerWindowRoute::None,
             });
+        }
+    }
+
+    pub(super) fn observe_pointer(
+        &self,
+        event_loop: &super::event_loop::ActiveEventLoop,
+        expected_press: Option<&crate::event::PointerPressToken>,
+    ) -> MacOSPointerObservation {
+        let matches = || {
+            expected_press.map_or(true, |press| self.ivars().primary_press.borrow().matches(press))
+        };
+        if !matches() {
+            return MacOSPointerObservation::Unavailable;
+        }
+        let screen = unsafe { NSEvent::mouseLocation() };
+        let buttons = unsafe { NSEvent::pressedMouseButtons() };
+        let quartz = super::monitor::flip_window_screen_coordinates(NSRect::new(
+            screen,
+            NSSize::new(0.0, 0.0),
+        ));
+        let desktop_position = quartz_desktop_position(CGPoint::new(quartz.x, quartz.y));
+        let hover = pointer_hover_at(screen, MainThreadMarker::from(self));
+        if !event_loop.pointer_observation_order_ready() || !matches() {
+            return MacOSPointerObservation::Unavailable;
+        }
+        if let Some(expected) = expected_press.filter(|_| buttons & 1 == 0) {
+            // The global state cannot complete a drop. It can only end the exact
+            // old sequence after any queued real up/down callbacks have drained.
+            if self.ivars().primary_press.borrow_mut().cancel_released(expected, buttons) {
+                self.reset_pointer_capture();
+            }
+            return MacOSPointerObservation::Unavailable;
+        }
+        MacOSPointerObservation::Observed {
+            facts: PointerEventFacts { desktop_position, hover, ..Default::default() },
+            delivery: PointerWindowRoute::Unknown,
         }
     }
 
@@ -1088,6 +1128,12 @@ impl WinitView {
 
     fn mouse_click(&self, event: &NSEvent, button_state: ElementState) {
         let button = mouse_button(event);
+        let primary_press = (button == MouseButton::Left)
+            .then(|| match button_state {
+                ElementState::Pressed => self.ivars().primary_press.borrow_mut().press(),
+                ElementState::Released => self.ivars().primary_press.borrow_mut().release(),
+            })
+            .flatten();
         let delivery = RootWindowId(self.window().id());
         let capture = update_pressed_mouse_buttons(
             self.ivars().pressed_mouse_buttons.get(),
@@ -1106,7 +1152,7 @@ impl WinitView {
         self.update_modifiers(event, false);
 
         self.queue_event(WindowEvent::MouseInput {
-            primary_press: None,
+            primary_press,
             device_id: DEVICE_ID,
             state: button_state,
             button,
@@ -1202,19 +1248,7 @@ impl WinitView {
         let mtm = MainThreadMarker::from(self);
         let window_point = unsafe { event.locationInWindow() };
         let screen_point = unsafe { self.window().convertPointToScreen(window_point) };
-        let frontmost = unsafe {
-            NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(screen_point, 0, mtm)
-        };
-        let app = NSApplication::sharedApplication(mtm);
-        classify_pointer_window_route(
-            frontmost,
-            app.windows().into_iter().filter_map(|window| {
-                window.is_kind_of::<WinitWindow>().then(|| {
-                    let platform_id = super::window::WindowId(Retained::as_ptr(&window) as usize);
-                    (unsafe { window.windowNumber() }, RootWindowId(platform_id))
-                })
-            }),
-        )
+        pointer_hover_at(screen_point, mtm)
     }
 
     fn event_logical_position(&self, event: &NSEvent) -> LogicalPosition<f64> {
@@ -1222,6 +1256,21 @@ impl WinitView {
         let view_point = self.convertPoint_fromView(window_point, None);
         LogicalPosition::new(view_point.x, view_point.y)
     }
+}
+
+fn pointer_hover_at(screen: NSPoint, mtm: MainThreadMarker) -> PointerWindowRoute {
+    let frontmost =
+        unsafe { NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(screen, 0, mtm) };
+    let app = NSApplication::sharedApplication(mtm);
+    classify_pointer_window_route(
+        frontmost,
+        app.windows().into_iter().filter_map(|window| {
+            window.is_kind_of::<WinitWindow>().then(|| {
+                let platform_id = super::window::WindowId(Retained::as_ptr(&window) as usize);
+                (unsafe { window.windowNumber() }, RootWindowId(platform_id))
+            })
+        }),
+    )
 }
 
 fn pointer_position_and_geometry(
@@ -1287,6 +1336,10 @@ fn event_desktop_position(event: &NSEvent) -> Option<PhysicalPosition<f64>> {
     }
 
     let point = unsafe { CGEventGetLocation(cg_event.cast()) };
+    quartz_desktop_position(point)
+}
+
+fn quartz_desktop_position(point: CGPoint) -> Option<PhysicalPosition<f64>> {
     let mappings = CGDisplay::active_displays()
         .ok()?
         .into_iter()

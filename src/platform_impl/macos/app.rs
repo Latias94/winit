@@ -20,6 +20,11 @@ type SendEvent = extern "C" fn(&NSApplication, Sel, &NSEvent);
 static mut ORIGINAL: Cell<Option<SendEvent>> = Cell::new(None);
 
 extern "C" fn send_event(app: &NSApplication, sel: Sel, event: &NSEvent) {
+    let delegate = ApplicationDelegate::get(MainThreadMarker::from(app));
+    delegate.with_native_dispatch(|| dispatch_event(app, sel, event));
+}
+
+fn dispatch_event(app: &NSApplication, sel: Sel, event: &NSEvent) {
     let mtm = MainThreadMarker::from(app);
 
     // Normally, holding Cmd + any key never sends us a `keyUp` event for that key.
