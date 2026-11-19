@@ -371,7 +371,8 @@ fn key_input(
         None => return,
     };
 
-    let device_id = crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
+    let device_id =
+        crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId::dummy()));
     if let Some(mut key_context) = keyboard_state.xkb_context.key_context() {
         let event = key_context.process_key_event(keycode, state, repeat);
         let event = WindowEvent::KeyboardInput { device_id, event, is_synthetic: false };

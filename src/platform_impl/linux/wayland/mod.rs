@@ -1,6 +1,7 @@
 //! Winit's Wayland backend.
 
 use std::fmt::Display;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use sctk::reexports::client::globals::{BindError, GlobalError};
@@ -61,13 +62,22 @@ impl From<WaylandError> for OsError {
     }
 }
 
-/// Dummy device id, since Wayland doesn't have device events.
+/// A backend-generated touch capability identity; keyboard and pointer events use the dummy id.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DeviceId;
+pub struct DeviceId(usize);
 
 impl DeviceId {
     pub const fn dummy() -> Self {
-        DeviceId
+        Self(0)
+    }
+
+    fn fresh_touch() -> Option<Self> {
+        // Capabilities can be recreated on the same seat, including in a new event loop.
+        static NEXT_TOUCH_ID: AtomicUsize = AtomicUsize::new(1);
+        NEXT_TOUCH_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()
+            .map(Self)
     }
 }
 

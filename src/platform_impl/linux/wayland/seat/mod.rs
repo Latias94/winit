@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use ahash::AHashMap;
 use tracing::warn;
 
 use sctk::reexports::client::backend::ObjectId;
@@ -30,18 +29,15 @@ pub use text_input::{TextInputState, ZwpTextInputV3Ext};
 
 use keyboard::{KeyboardData, KeyboardState};
 use text_input::TextInputData;
-use touch::TouchPoint;
+use touch::TouchCapability;
 
 #[derive(Debug, Default)]
 pub struct WinitSeatState {
     /// The pointer bound on the seat.
     pointer: Option<Arc<ThemedPointer<WinitPointerData>>>,
 
-    /// The touch bound on the seat.
-    touch: Option<WlTouch>,
-
-    /// The mapping from touched points to the surfaces they're present.
-    touch_map: AHashMap<i32, TouchPoint>,
+    /// The current touch object, its device identity, and its active contacts.
+    touch: Option<TouchCapability>,
 
     /// The text input bound on the seat.
     text_input: Option<Arc<ZwpTextInputV3>>,
@@ -62,6 +58,10 @@ pub struct WinitSeatState {
 impl WinitSeatState {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    fn touch_for(&mut self, touch: &WlTouch) -> Option<&mut TouchCapability> {
+        self.touch.as_mut().filter(|current| current.matches(touch))
     }
 }
 
@@ -87,7 +87,11 @@ impl SeatHandler for WinitState {
 
         match capability {
             SeatCapability::Touch if seat_state.touch.is_none() => {
-                seat_state.touch = self.seat_state.get_touch(queue_handle, &seat).ok();
+                seat_state.touch = self
+                    .seat_state
+                    .get_touch(queue_handle, &seat)
+                    .ok()
+                    .and_then(TouchCapability::new);
             },
             SeatCapability::Keyboard if seat_state.keyboard_state.is_none() => {
                 let keyboard = seat.get_keyboard(queue_handle, KeyboardData::new(seat.clone()));
@@ -165,9 +169,7 @@ impl SeatHandler for WinitState {
         match capability {
             SeatCapability::Touch => {
                 if let Some(touch) = seat_state.touch.take() {
-                    if touch.version() >= 3 {
-                        touch.release();
-                    }
+                    self.on_touch_destroy(touch);
                 }
             },
             SeatCapability::Pointer => {
@@ -214,7 +216,11 @@ impl SeatHandler for WinitState {
         _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        let _ = self.seats.remove(&seat.id());
+        if let Some(mut seat_state) = self.seats.remove(&seat.id()) {
+            if let Some(touch) = seat_state.touch.take() {
+                self.on_touch_destroy(touch);
+            }
+        }
         self.on_keyboard_destroy(&seat.id());
     }
 }

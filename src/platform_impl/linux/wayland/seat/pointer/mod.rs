@@ -64,7 +64,8 @@ impl PointerHandler for WinitState {
             },
         };
 
-        let device_id = crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
+        let device_id =
+            crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId::dummy()));
 
         for event in events {
             let surface = &event.surface;
